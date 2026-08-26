@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 
 from .models import (
@@ -132,7 +133,9 @@ class JobManager:
             repeated_anchors=list(
                 source_svg.repeated_anchors
             ),
-            transform=source_svg.transform,
+            transform=replace(
+                source_svg.transform
+            ),
             gcode=gcode,
             source_svg_id=source_svg.id,
             generated_from_svg=True,
@@ -160,3 +163,37 @@ class JobManager:
             j for j in self.jobs
             if j.id != job_id
         ]
+
+    def metrics(self, job: Job) -> dict:
+        stats = getattr(job, "stats", None)
+
+        if not stats:
+            return {
+                "time": 0.0,
+                "draw_distance": 0.0,
+                "travel_distance": 0.0,
+            }
+
+        return {
+            "time": float(
+                getattr(
+                    stats,
+                    "estimated_seconds",
+                    0.0,
+                )
+            ),
+            "draw_distance": float(
+                getattr(
+                    stats,
+                    "drawing_distance",
+                    0.0,
+                )
+            ),
+            "travel_distance": float(
+                getattr(
+                    stats,
+                    "travel_distance",
+                    0.0,
+                )
+            ),
+        }

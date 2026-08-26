@@ -74,6 +74,7 @@ class Job:
     visible: bool = True
 
     origin: str = "machine"
+    repeat_anchors: bool = False
 
     transform: Transform = field(
         default_factory=Transform
@@ -95,9 +96,16 @@ class Job:
 
     preview_limit: int = 15000
 
-    stats: dict = field(
-        default_factory=dict
-    )
+    stats: "GCodeStats | None" = None
+
+
+@dataclass
+class GCodeStats:
+    drawing_distance: float = 0.0
+    travel_distance: float = 0.0
+    drawing_moves: int = 0
+    travel_moves: int = 0
+    estimated_seconds: float = 0.0
 
 
 class JobManager:
