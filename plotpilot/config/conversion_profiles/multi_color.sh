@@ -1,75 +1,85 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$ROOT/../../lib/cli.sh"
+SCRIPT_DIR="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")" &&
+    pwd
+)"
 
-SPEC='
+source "$SCRIPT_DIR/../../lib/cli.sh"
+
+CLI_SPEC='
 {
-  "profile": {
-    "type": "string",
-    "default": "multi-color",
-    "description": "Conversion profile"
+  "name": "multi-color",
+  "description": "Convert SVG to multi-color G-code",
+
+  "input": {
+    "type": "svg",
+    "transport": [
+      "file",
+      "stdin"
+    ]
   },
-  "pause_between_colors": {
-    "type": "boolean",
-    "default": true,
-    "description": "Pause between pen colors"
+
+  "output": {
+    "type": "gcode",
+    "transport": [
+      "file",
+      "stdout"
+    ]
   },
-  "scale": {
-    "type": "number",
-    "default": 1.0,
-    "description": "SVG scale"
+
+  "parameters": {
+    "profile": {
+      "type": "string",
+      "default": "multi-color",
+      "description": "Conversion profile"
+    },
+
+    "pause_between_colors": {
+      "type": "boolean",
+      "default": true,
+      "description": "Pause between pen colors"
+    },
+
+    "scale": {
+      "type": "number",
+      "default": 1.0,
+      "description": "SVG scale"
+    }
   }
 }
 '
 
-cli_init "$SPEC" "$@"
+cli_init "$CLI_SPEC" "$@"
 
-if [[ "$CLI_MODE" == "json" ]]; then
-    exit 0
-fi
+INPUT_TMP="$(mktemp --suffix=.svg)"
+OUTPUT_TMP="$(mktemp --suffix=.gcode)"
 
-python3 - "$input" "$output" "$pause_between_colors" "$scale" <<'PY'
-import subprocess
-import sys
-from pathlib import Path
+cleanup() {
+    rm -f "$INPUT_TMP" "$OUTPUT_TMP"
+}
 
-input_file = Path(sys.argv[1])
-output_file = Path(sys.argv[2])
+trap cleanup EXIT
 
-pause = sys.argv[3] == "true"
-scale = float(sys.argv[4])
+cli_read_input > "$INPUT_TMP"
 
-cmd = [
-    "vpype",
-    "read",
-    str(input_file),
-    "write",
-    str(output_file),
-]
+PROJECT_ROOT="$(
+    cd "$SCRIPT_DIR/../../.." &&
+    pwd
+)"
 
-result = subprocess.run(
-    cmd,
-    capture_output=True,
-    text=True,
-)
+# ------------------------------------------------------------
+# Use the existing PlotPilot SVG -> G-code converter.
+# ------------------------------------------------------------
 
-if result.returncode != 0:
-    raise SystemExit(result.stderr)
+PYTHONPATH="$PROJECT_ROOT" \
+python -m plotpilot.converters.svg_to_gcode.pipeline \
+    "$INPUT_TMP" \
+    "$OUTPUT_TMP" \
+    --profile "$profile" \
+    --pause-between-colors "$pause_between_colors" \
+    --scale "$scale"
 
-if pause:
-    text = output_file.read_text(encoding="utf-8")
-
-    lines = text.splitlines()
-
-    output = []
-
-    for line in lines:
-        output.append(line)
-
-    output_file.write_text(
-        "\n".join(output) + "\n",
-        encoding="utf-8",
-    )
-PY
+cli_write_file "$OUTPUT_TMP"

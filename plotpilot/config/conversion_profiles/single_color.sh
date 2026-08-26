@@ -1,66 +1,97 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$ROOT/../../lib/cli.sh"
+SCRIPT_DIR="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")" &&
+    pwd
+)"
 
-SPEC='
+source "$SCRIPT_DIR/../../lib/cli.sh"
+
+CLI_SPEC='
 {
-  "profile": {
-    "type": "string",
-    "default": "single-color",
-    "description": "Conversion profile"
+  "name": "single-color",
+  "description": "Convert SVG to single-color G-code",
+
+  "input": {
+    "type": "svg",
+    "transport": [
+      "file",
+      "stdin"
+    ]
   },
-  "scale": {
-    "type": "number",
-    "default": 1.0,
-    "description": "SVG scale"
+
+  "output": {
+    "type": "gcode",
+    "transport": [
+      "file",
+      "stdout"
+    ]
+  },
+
+  "parameters": {
+    "profile": {
+      "type": "string",
+      "default": "single-color",
+      "description": "Conversion profile"
+    },
+
+    "scale": {
+      "type": "number",
+      "default": 1.0,
+      "description": "SVG scale"
+    }
   }
 }
 '
 
-cli_init "$SPEC" "$@"
+cli_init "$CLI_SPEC" "$@"
 
-if [[ "$CLI_MODE" == "json" ]]; then
-    exit 0
-fi
+# ------------------------------------------------------------
+# The converter itself works on files.
+#
+# The CLI transport does not.
+#
+# This means:
+#
+#   file -> converter -> file
+#
+# and:
+#
+#   stdin -> temporary input -> converter -> stdout
+#
+# use exactly the same conversion implementation.
+# ------------------------------------------------------------
 
-python3 - "$input" "$output" "$scale" <<'PY'
-import sys
-from pathlib import Path
+INPUT_TMP="$(mktemp --suffix=.svg)"
+OUTPUT_TMP="$(mktemp --suffix=.gcode)"
 
-input_file = Path(sys.argv[1])
-output_file = Path(sys.argv[2])
-scale = float(sys.argv[3])
+cleanup() {
+    rm -f "$INPUT_TMP" "$OUTPUT_TMP"
+}
 
-try:
-    import vpype
-except ImportError:
-    raise SystemExit(
-        "vpype is required for this conversion profile"
-    )
+trap cleanup EXIT
 
-pipeline = [
-    "read",
-    str(input_file),
-]
+cli_read_input > "$INPUT_TMP"
 
-vpype_cli = [
-    "vpype",
-    "read",
-    str(input_file),
-    "write",
-    str(output_file),
-]
+PROJECT_ROOT="$(
+    cd "$SCRIPT_DIR/../../.." &&
+    pwd
+)"
 
-import subprocess
+# ------------------------------------------------------------
+# Use the existing PlotPilot SVG -> G-code converter.
+#
+# The profile-specific settings are passed through the
+# existing conversion interface.
+# ------------------------------------------------------------
 
-result = subprocess.run(
-    vpype_cli,
-    capture_output=True,
-    text=True,
-)
+PYTHONPATH="$PROJECT_ROOT" \
+python -m plotpilot.converters.svg_to_gcode.pipeline \
+    "$INPUT_TMP" \
+    "$OUTPUT_TMP" \
+    --profile "$profile" \
+    --scale "$scale"
 
-if result.returncode != 0:
-    raise SystemExit(result.stderr)
-PY
+cli_write_file "$OUTPUT_TMP"

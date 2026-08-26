@@ -6,6 +6,7 @@ import json
 import math
 import re
 import subprocess
+from datetime import datetime, timedelta
 import sys
 
 import os
@@ -59,6 +60,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QWidget,
+    QMessageBox,
 )
 
 
@@ -3979,20 +3981,69 @@ class JobPropertiesPanel(QFrame):
         parameters = self._parameters()
 
         try:
-            if hasattr(
-                self.jobs,
-                "convert_svg",
-            ):
-                new_job = self.jobs.convert_svg(
-                    self.job,
-                    profile,
-                    parameters,
+            command = [
+                str(profile.command),
+                "--input",
+                str(self.job.source),
+                "--output",
+                "-",
+            ]
+
+            for name, value in parameters.items():
+                if value is None:
+                    continue
+
+                option = f"--{name}"
+
+                if isinstance(value, bool):
+                    if value:
+                        command.append(option)
+                else:
+                    command.extend(
+                        [
+                            option,
+                            str(value),
+                        ]
+                    )
+
+            print(
+                "RUNTIME PROFILE CONVERSION:",
+                command,
+                flush=True,
+            )
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+            )
+
+            if result.returncode != 0:
+                error = (
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or (
+                        "Conversion profile exited "
+                        f"with code {result.returncode}"
+                    )
                 )
 
-            else:
+                raise RuntimeError(error)
+
+            gcode = result.stdout
+
+            if not gcode.strip():
                 raise RuntimeError(
-                    "JobManager does not provide convert_svg()"
+                    "Conversion profile produced no G-code "
+                    "on stdout"
                 )
+
+            new_job = self.jobs.create_generated_gcode(
+                self.job,
+                gcode,
+                profile.name,
+                parameters,
+            )
 
             self.converted.emit(
                 new_job.id
@@ -4439,6 +4490,49 @@ def ensure_default_config():
 
 
 # ============================================================
+# Temporary conversion files
+# ============================================================
+
+PLOTPILOT_TEMP_DIR = Path(
+    '/home/erik/Projects/plotter/PlotterPilot/plotpilot/.tmp'
+)
+
+PLOTPILOT_TEMP_MAX_AGE_DAYS = 7
+
+
+def cleanup_conversion_temp():
+    PLOTPILOT_TEMP_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    cutoff = (
+        datetime.now().timestamp()
+        - (
+            PLOTPILOT_TEMP_MAX_AGE_DAYS
+            * 24
+            * 60
+            * 60
+        )
+    )
+
+    for item in PLOTPILOT_TEMP_DIR.iterdir():
+        try:
+            if item.stat().st_mtime < cutoff:
+                if item.is_file() or item.is_symlink():
+                    item.unlink()
+                elif item.is_dir():
+                    import shutil
+                    shutil.rmtree(item)
+        except Exception as exc:
+            print(
+                "WARNING: failed to clean temporary file "
+                f"{item}: {exc}",
+                file=sys.stderr,
+            )
+
+
+# ============================================================
 # Application
 # ============================================================
 
@@ -4466,6 +4560,8 @@ def main():
     config = load_config(
         config_path
     )
+
+    cleanup_conversion_temp()
     print("RUNTIME MAIN: config loaded", flush=True)
 
     app = QApplication(
