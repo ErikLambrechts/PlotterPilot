@@ -5,3 +5,4 @@ old
 plotpilot/lib/__pycache__
 **/*.backup*
 **/*.bak
+plotpilot/G-code
