@@ -1,2 +1,7 @@
 cnc-sender/.venv
 cnc-sender/__pycache__
+old
+**/__pycache__
+plotpilot/lib/__pycache__
+**/*.backup*
+**/*.bak
