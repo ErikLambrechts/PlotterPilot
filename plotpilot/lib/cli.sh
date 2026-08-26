@@ -46,7 +46,7 @@ cli_init() {
                 ;;
 
             --*)
-                name="${1#--}"
+                local name="${1#--}"
 
                 if ! jq -e --arg name "$name" \
                     '.[$name]' <<< "$CLI_SPEC" >/dev/null
@@ -54,17 +54,22 @@ cli_init() {
                     cli_error "Unknown option: $1"
                 fi
 
+                local type
                 type=$(jq -r --arg name "$name" \
                     '.[$name].type' <<< "$CLI_SPEC")
 
-                if [[ "$type" == "boolean" ]]; then
-                    printf -v "$name" '%s' true
-                    shift
-                else
-                    [[ $# -ge 2 ]] || cli_error "$1 requires a value"
-                    printf -v "$name" '%s' "$2"
-                    shift 2
-                fi
+                case "$type" in
+                    boolean)
+                        printf -v "$name" '%s' true
+                        shift
+                        ;;
+
+                    *)
+                        [[ $# -ge 2 ]] || cli_error "$1 requires a value"
+                        printf -v "$name" '%s' "$2"
+                        shift 2
+                        ;;
+                esac
                 ;;
 
             *)
@@ -73,29 +78,28 @@ cli_init() {
         esac
     done
 
-    if [[ -z "$input" ]]; then
-        cli_error "--input is required"
-    fi
-
-    if [[ -z "$output" ]]; then
-        cli_error "--output is required"
-    fi
+    [[ -n "$input" ]] || cli_error "--input is required"
+    [[ -n "$output" ]] || cli_error "--output is required"
 }
 
 cli_help() {
     echo "Usage: $0 --input <file> --output <file> [OPTIONS]"
     echo
     echo "Common options:"
-    echo "  --input <file>"
-    echo "  --output <file>"
-    echo "  --help, -h"
-    echo "  --json"
+    echo "  --input <file>     Input file"
+    echo "  --output <file>    Output file"
+    echo "  --help, -h         Show this help"
+    echo "  --json             Output parameter specification as JSON"
     echo
     echo "Profile options:"
 
     jq -r '
         to_entries[] |
-        "  --\(.key) <value>\t\(.value.description) (default: \(.value.default))"
+        if .value.type == "boolean" then
+            "  --\(.key)\t\(.value.description) (default: \(.value.default))"
+        else
+            "  --\(.key) <value>\t\(.value.description) (default: \(.value.default))"
+        end
     ' <<< "$CLI_SPEC"
 }
 
@@ -103,16 +107,17 @@ cli_json() {
     jq '
         {
             input: {
-                type: "string",
+                type: "file",
                 required: true,
                 description: "Input file"
             },
             output: {
-                type: "string",
+                type: "file",
                 required: true,
                 description: "Output file"
-            }
-        } + .
+            },
+            parameters: .
+        }
     ' <<< "$CLI_SPEC"
 }
 

@@ -14,76 +14,187 @@ class ProfileParameter:
     description: str = ""
     minimum: float | None = None
     maximum: float | None = None
-    choices: list[str] = field(default_factory=list)
+    options: list[str] = field(default_factory=list)
 
 
 @dataclass
 class ConversionProfile:
-    path: Path
     name: str
-    parameters: list[ProfileParameter] = field(default_factory=list)
+    path: Path
+    description: str = ""
+    parameters: list[ProfileParameter] = field(
+        default_factory=list
+    )
+    spec: dict = field(default_factory=dict)
+
+    @property
+    def command(self) -> str:
+        return str(self.path)
 
 
 class ProfileManager:
-    def __init__(self, paths):
-        self.paths = list(paths)
+
+    def __init__(
+        self,
+        directories,
+    ):
+        self.directories = [
+            Path(directory)
+            for directory in directories
+        ]
         self.profiles: list[ConversionProfile] = []
 
     def discover(self):
         self.profiles.clear()
 
-        for path in self.paths:
-            if not path.exists():
+        for directory in self.directories:
+            directory = directory.resolve()
+
+            if not directory.is_dir():
                 continue
 
-            if not path.is_file():
-                continue
+            for script in sorted(
+                directory.glob("*.sh")
+            ):
+                if not script.is_file():
+                    continue
 
-            try:
-                result = subprocess.run(
-                    [str(path), "--json"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    check=True,
+                try:
+                    spec = self._query_json(script)
+                except Exception as exc:
+                    print(
+                        f"Profile ignored: "
+                        f"{script}: {exc}"
+                    )
+                    continue
+
+                raw_parameters = spec.get(
+                    "parameters",
+                    {},
                 )
 
-                data = json.loads(result.stdout)
+                if not isinstance(
+                    raw_parameters,
+                    dict,
+                ):
+                    raw_parameters = {}
 
-                params = []
+                parameters = []
 
-                for name, spec in data.items():
-                    if name in {"input", "output"}:
+                for name, value in raw_parameters.items():
+
+                    if not isinstance(value, dict):
                         continue
 
-                    params.append(
+                    parameters.append(
                         ProfileParameter(
                             name=name,
-                            type=spec.get("type", "string"),
-                            default=spec.get("default"),
-                            description=spec.get(
-                                "description", ""
+                            type=value.get(
+                                "type",
+                                "string",
                             ),
-                            minimum=spec.get("minimum"),
-                            maximum=spec.get("maximum"),
-                            choices=spec.get("choices", []),
+                            default=value.get(
+                                "default"
+                            ),
+                            description=value.get(
+                                "description",
+                                "",
+                            ),
+                            minimum=value.get(
+                                "minimum"
+                            ),
+                            maximum=value.get(
+                                "maximum"
+                            ),
+                            options=value.get(
+                                "options",
+                                [],
+                            ),
                         )
                     )
 
-                self.profiles.append(
-                    ConversionProfile(
-                        path=path,
-                        name=data.get(
-                            "_name",
-                            path.stem.replace("_", " ").title(),
-                        ),
-                        parameters=params,
+                name = script.stem.replace(
+                    "_",
+                    "-",
+                )
+
+                profile_parameter = (
+                    raw_parameters.get(
+                        "profile"
                     )
                 )
 
-            except Exception as exc:
-                print(
-                    f"Profile ignored: {path}: {exc}"
+                if isinstance(
+                    profile_parameter,
+                    dict,
+                ):
+                    default_name = (
+                        profile_parameter.get(
+                            "default"
+                        )
+                    )
+
+                    if default_name:
+                        name = str(
+                            default_name
+                        )
+
+                self.profiles.append(
+                    ConversionProfile(
+                        name=name,
+                        path=script,
+                        description=spec.get(
+                            "description",
+                            "",
+                        ),
+                        parameters=parameters,
+                        spec=spec,
+                    )
                 )
 
         return self.profiles
+
+    @staticmethod
+    def _query_json(script: Path) -> dict:
+        result = subprocess.run(
+            [
+                str(script),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "--json failed"
+            )
+
+        try:
+            data = json.loads(
+                result.stdout
+            )
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"invalid JSON: {exc}"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "JSON root must be an object"
+            )
+
+        return data
+
+    def get(
+        self,
+        name: str,
+    ) -> ConversionProfile | None:
+
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+
+        return None

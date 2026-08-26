@@ -1,28 +1,28 @@
-from __future__ import annotations
-
 import math
-import subprocess
-import tempfile
+import re
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QPointF,
     Qt,
     QThread,
+    QTimer,
     Signal,
-    QRectF,
 )
+
 from PySide6.QtGui import (
+    QBrush,
     QColor,
+    QFont,
     QPainter,
+    QPalette,
     QPen,
 )
+
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -32,441 +32,30 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QFileDialog,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from .models import JobSourceType
-from .preview import gcode_segments
-from .profiles import ProfileManager
 
+"""
+PlotPilot module extracted from plotpilot.py.
 
-def fmt_time(seconds):
-    seconds = max(0, int(seconds))
-
-    hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
-
-    if hours:
-        return f"{hours}h {minutes:02d}m"
-
-    if minutes:
-        return f"{minutes}m {seconds:02d}s"
-
-    return f"{seconds}s"
-
-
-class Worker(QThread):
-    succeeded = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, function):
-        super().__init__()
-        self.function = function
-
-    def run(self):
-        try:
-            self.succeeded.emit(
-                self.function()
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-
-class Collapsible(QFrame):
-    def __init__(self, title, widget, expanded=False):
-        super().__init__()
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self.button = QPushButton()
-        self.button.setCheckable(True)
-        self.button.setChecked(expanded)
-
-        self.widget = widget
-
-        self.button.clicked.connect(
-            self.update
-        )
-
-        layout.addWidget(self.button)
-        layout.addWidget(widget)
-
-        self.update()
-
-    def update(self):
-        expanded = self.button.isChecked()
-
-        self.widget.setVisible(expanded)
-
-        title = self.button.text()
-        title = title.lstrip("▶▼ ")
-
-        self.button.setText(
-            ("▼ " if expanded else "▶ ")
-            + title
-        )
-
-
-class WorkspaceView(QWidget):
-    selected = Signal(str)
-    moved = Signal(str)
-
-    def __init__(self, workspace, jobs):
-        super().__init__()
-
-        self.workspace = workspace
-        self.jobs = jobs
-
-        self.zoom = 1.0
-        self.pan_x = 80.0
-        self.pan_y = 80.0
-
-        self.machine_x = 0
-        self.machine_y = 0
-
-        self.selected_id = None
-
-        self.panning = False
-        self.pan_start = QPointF()
-        self.pan_origin = (0, 0)
-
-        self.dragging = False
-        self.drag_id = None
-
-        self.setMinimumSize(500, 500)
-        self.setFocusPolicy(Qt.StrongFocus)
-
-    def world_to_screen(self, x, y):
-        # Machine coordinates have Y pointing upwards.
-        return (
-            self.pan_x + x * self.zoom,
-            self.pan_y
-            + (self.workspace.height - y)
-            * self.zoom,
-        )
-
-    def screen_to_world(self, p):
-        x = (
-            p.x() - self.pan_x
-        ) / self.zoom
-
-        y = self.workspace.height - (
-            p.y() - self.pan_y
-        ) / self.zoom
-
-        return x, y
-
-    def set_selected(self, job_id):
-        self.selected_id = job_id
-        self.update()
-
-    def set_machine_position(self, x, y):
-        self.machine_x = x
-        self.machine_y = y
-        self.update()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MiddleButton:
-            self.panning = True
-            self.pan_start = event.position()
-            self.pan_origin = (
-                self.pan_x,
-                self.pan_y,
-            )
-            self.setCursor(Qt.ClosedHandCursor)
-            return
-
-        if event.button() == Qt.LeftButton:
-            x, y = self.screen_to_world(
-                event.position()
-            )
-
-            for job in reversed(self.jobs.jobs):
-                if not job.active or not job.visible:
-                    continue
-
-                if self.hit(job, x, y):
-                    self.selected_id = job.id
-                    self.dragging = True
-                    self.drag_id = job.id
-                    self.drag_offset = (
-                        x - job.transform.offset_x,
-                        y - job.transform.offset_y,
-                    )
-                    self.selected.emit(job.id)
-                    self.update()
-                    return
-
-    def mouseMoveEvent(self, event):
-        if self.panning:
-            delta = (
-                event.position()
-                - self.pan_start
-            )
-
-            self.pan_x = (
-                self.pan_origin[0]
-                + delta.x()
-            )
-
-            self.pan_y = (
-                self.pan_origin[1]
-                + delta.y()
-            )
-
-            self.update()
-            return
-
-        if self.dragging:
-            job = self.jobs.get(self.drag_id)
-
-            if job:
-                x, y = self.screen_to_world(
-                    event.position()
-                )
-
-                job.transform.offset_x = (
-                    x - self.drag_offset[0]
-                )
-
-                job.transform.offset_y = (
-                    y - self.drag_offset[1]
-                )
-
-                self.moved.emit(job.id)
-                self.update()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MiddleButton:
-            self.panning = False
-            self.setCursor(Qt.ArrowCursor)
-
-        elif event.button() == Qt.LeftButton:
-            self.dragging = False
-            self.drag_id = None
-
-    def wheelEvent(self, event):
-        old_zoom = self.zoom
-
-        factor = (
-            1.15
-            if event.angleDelta().y() > 0
-            else 1 / 1.15
-        )
-
-        self.zoom = max(
-            0.05,
-            min(20.0, self.zoom * factor),
-        )
-
-        mouse = event.position()
-
-        wx, wy = self.screen_to_world(mouse)
-
-        self.pan_x = (
-            mouse.x()
-            - wx * self.zoom
-        )
-
-        self.pan_y = (
-            mouse.y()
-            - (
-                self.workspace.height - wy
-            ) * self.zoom
-        )
-
-        self.update()
-
-    def hit(self, job, x, y):
-        width = 120 * job.transform.scale
-        height = 80 * job.transform.scale
-
-        ox = job.transform.offset_x
-        oy = job.transform.offset_y
-
-        return (
-            ox <= x <= ox + width
-            and
-            oy - height <= y <= oy
-        )
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(
-            QPainter.Antialiasing
-        )
-
-        painter.fillRect(
-            self.rect(),
-            QColor("#e7e9ec"),
-        )
-
-        rect = QRectF(
-            self.pan_x,
-            self.pan_y,
-            self.workspace.width * self.zoom,
-            self.workspace.height * self.zoom,
-        )
-
-        painter.setPen(
-            QPen(QColor("#65707c"), 2)
-        )
-        painter.setBrush(
-            QColor("#f8f9fa")
-        )
-        painter.drawRect(rect)
-
-        for anchor in self.workspace.anchors:
-            x, y = self.world_to_screen(
-                anchor.x,
-                anchor.y,
-            )
-
-            painter.setPen(
-                QPen(QColor("#6b7280"), 1)
-            )
-
-            painter.drawLine(
-                x - 7, y, x + 7, y
-            )
-            painter.drawLine(
-                x, y - 7, x, y + 7
-            )
-
-            painter.drawText(
-                x + 9,
-                y - 8,
-                anchor.name,
-            )
-
-        for job in self.jobs.jobs:
-            if not job.active or not job.visible:
-                continue
-
-            x, y = self.world_to_screen(
-                job.transform.offset_x,
-                job.transform.offset_y,
-            )
-
-            if job.source_type == JobSourceType.GCODE:
-                self.paint_gcode(
-                    painter,
-                    job,
-                )
-                continue
-
-            width = 120 * job.transform.scale
-            height = 80 * job.transform.scale
-
-            color = (
-                QColor("#d7e8f8")
-                if job.id == self.selected_id
-                else QColor("#dce7df")
-            )
-
-            painter.setPen(
-                QPen(QColor("#4b5563"), 2)
-            )
-            painter.setBrush(color)
-
-            painter.drawRect(
-                QRectF(
-                    x,
-                    y - height * self.zoom,
-                    width * self.zoom,
-                    height * self.zoom,
-                )
-            )
-
-            painter.setPen(
-                QColor("#263238")
-            )
-
-            painter.drawText(
-                x + 6,
-                y - height * self.zoom / 2,
-                job.name,
-            )
-
-        mx, my = self.world_to_screen(
-            self.machine_x,
-            self.machine_y,
-        )
-
-        painter.setPen(
-            QPen(QColor("#c62828"), 2)
-        )
-
-        painter.drawEllipse(
-            QPointF(mx, my),
-            7,
-            7,
-        )
-
-        painter.drawLine(
-            mx - 12, my,
-            mx + 12, my,
-        )
-
-        painter.drawLine(
-            mx, my - 12,
-            mx, my + 12,
-        )
-
-    def paint_gcode(self, painter, job):
-        if not job.gcode:
-            return
-
-        segments = gcode_segments(
-            job.gcode,
-            job.preview_limit,
-        )
-
-        ox = job.transform.offset_x
-        oy = job.transform.offset_y
-
-        for segment in segments:
-            x1 = ox + segment.x1
-            y1 = oy + segment.y1
-            x2 = ox + segment.x2
-            y2 = oy + segment.y2
-
-            sx1, sy1 = self.world_to_screen(
-                x1, y1
-            )
-            sx2, sy2 = self.world_to_screen(
-                x2, y2
-            )
-
-            if segment.drawing:
-                pen = QPen(
-                    QColor("#2563a8"),
-                    max(1, self.zoom * 1.2),
-                )
-            else:
-                pen = QPen(
-                    QColor("#9ca3af"),
-                    1,
-                    Qt.DashLine,
-                )
-
-            painter.setPen(pen)
-            painter.drawLine(
-                sx1,
-                sy1,
-                sx2,
-                sy2,
-            )
-
+This module is intentionally conservative.
+The first refactor keeps the existing implementation intact.
+"""
 
 class MachinePanel(QFrame):
+    stateChanged = Signal()
+
     def __init__(self, machine):
         super().__init__()
+
+        self.profiles = profiles or []
 
         self.machine = machine
         self.worker = None
@@ -477,16 +66,18 @@ class MachinePanel(QFrame):
             QLabel("<b>Machine</b>")
         )
 
-        group = QGroupBox("Connection")
-        group_layout = QVBoxLayout(group)
+        connection = QGroupBox("Connection")
+        connection_layout = QVBoxLayout(connection)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Host"))
 
-        self.host = QLineEdit(machine.host)
-        row.addWidget(self.host)
+        self.host = QLineEdit(
+            machine.host
+        )
 
-        group_layout.addLayout(row)
+        row.addWidget(self.host)
+        connection_layout.addLayout(row)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Port"))
@@ -496,40 +87,58 @@ class MachinePanel(QFrame):
         self.port.setValue(machine.port)
 
         row.addWidget(self.port)
-        group_layout.addLayout(row)
+        connection_layout.addLayout(row)
 
-        layout.addWidget(group)
+        layout.addWidget(connection)
 
-        self.button = QPushButton("Connect")
-        self.button.clicked.connect(self.toggle)
-        layout.addWidget(self.button)
+        self.connect_button = QPushButton(
+            "Connect"
+        )
 
-        self.status = QLabel("Disconnected")
-        layout.addWidget(self.status)
+        self.connect_button.clicked.connect(
+            self.toggle
+        )
+
+        layout.addWidget(
+            self.connect_button
+        )
+
+        self.status = QLabel(
+            "Disconnected"
+        )
+
+        layout.addWidget(
+            self.status
+        )
 
         self.position = QLabel(
             "X: --\nY: --\nZ: --"
         )
-        layout.addWidget(self.position)
+
+        layout.addWidget(
+            self.position
+        )
 
         layout.addWidget(
             QLabel("<b>Jog</b>")
         )
 
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Step"))
+
         self.step = QDoubleSpinBox()
-        self.step.setRange(0.01, 10000)
+        self.step.setRange(
+            0.01,
+            10000,
+        )
         self.step.setValue(10)
         self.step.setDecimals(2)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Step"))
         row.addWidget(self.step)
+
         layout.addLayout(row)
 
         def jog(x, y, z):
-            if not self.machine.state.connected:
-                return
-
             try:
                 self.machine.jog(x, y, z)
             except Exception as exc:
@@ -538,49 +147,59 @@ class MachinePanel(QFrame):
                 )
 
         row = QHBoxLayout()
-        button = QPushButton("↑")
-        button.clicked.connect(
-            lambda: jog(
+
+        up = QPushButton("↑")
+        up.clicked.connect(
+            lambda:
+            jog(
                 0,
                 self.step.value(),
                 0,
             )
         )
+
         row.addStretch()
-        row.addWidget(button)
+        row.addWidget(up)
         row.addStretch()
+
         layout.addLayout(row)
 
         row = QHBoxLayout()
 
-        button = QPushButton("←")
-        button.clicked.connect(
-            lambda: jog(
+        left = QPushButton("←")
+        right = QPushButton("→")
+
+        left.clicked.connect(
+            lambda:
+            jog(
                 -self.step.value(),
                 0,
                 0,
             )
         )
-        row.addWidget(button)
 
-        row.addStretch()
-
-        button = QPushButton("→")
-        button.clicked.connect(
-            lambda: jog(
+        right.clicked.connect(
+            lambda:
+            jog(
                 self.step.value(),
                 0,
                 0,
             )
         )
-        row.addWidget(button)
+
+        row.addWidget(left)
+        row.addStretch()
+        row.addWidget(right)
 
         layout.addLayout(row)
 
         row = QHBoxLayout()
-        button = QPushButton("↓")
-        button.clicked.connect(
-            lambda: jog(
+
+        down = QPushButton("↓")
+
+        down.clicked.connect(
+            lambda:
+            jog(
                 0,
                 -self.step.value(),
                 0,
@@ -588,7 +207,7 @@ class MachinePanel(QFrame):
         )
 
         row.addStretch()
-        row.addWidget(button)
+        row.addWidget(down)
         row.addStretch()
 
         layout.addLayout(row)
@@ -596,17 +215,20 @@ class MachinePanel(QFrame):
         row = QHBoxLayout()
 
         zp = QPushButton("Z+")
+        zm = QPushButton("Z-")
+
         zp.clicked.connect(
-            lambda: jog(
+            lambda:
+            jog(
                 0,
                 0,
                 self.step.value(),
             )
         )
 
-        zm = QPushButton("Z-")
         zm.clicked.connect(
-            lambda: jog(
+            lambda:
+            jog(
                 0,
                 0,
                 -self.step.value(),
@@ -624,51 +246,73 @@ class MachinePanel(QFrame):
             )
 
             button.clicked.connect(
-                lambda checked=False, a=axis:
+                lambda checked=False,
+                a=axis:
                 self.home(a)
             )
 
             layout.addWidget(button)
 
-        home = QPushButton("Home All")
+        home = QPushButton(
+            "Home All"
+        )
+
         home.clicked.connect(
-            lambda: self.home(None)
+            lambda:
+            self.home(None)
         )
 
         layout.addWidget(home)
 
-        zero = QPushButton("Set Zero")
-        zero.clicked.connect(self.zero)
+        zero = QPushButton(
+            "Set Zero"
+        )
+
+        zero.clicked.connect(
+            self.set_zero
+        )
+
         layout.addWidget(zero)
 
         layout.addStretch()
 
     def toggle(self):
+        if self.worker is not None:
+            if self.worker.isRunning():
+                return
+
         if self.machine.state.connected:
             self.machine.disconnect()
-            self.button.setText("Connect")
-            self.status.setText("Disconnected")
+
+            self.connect_button.setText(
+                "Connect"
+            )
+
+            self.status.setText(
+                "Disconnected"
+            )
+
+            self.stateChanged.emit()
             return
 
-        self.machine.host = (
-            self.host.text().strip()
-        )
+        host = self.host.text().strip()
 
-        self.machine.port = self.port.value()
-
-        if not self.machine.host:
+        if not host:
             self.status.setText(
                 "Enter a host"
             )
             return
 
-        self.button.setEnabled(False)
+        self.machine.host = host
+        self.machine.port = self.port.value()
+
+        self.connect_button.setEnabled(False)
         self.status.setText(
             "Connecting..."
         )
 
-        self.worker = Worker(
-            self.machine.connect
+        self.worker = ConnectWorker(
+            self.machine
         )
 
         self.worker.succeeded.connect(
@@ -680,22 +324,46 @@ class MachinePanel(QFrame):
         )
 
         self.worker.finished.connect(
-            lambda:
-            self.button.setEnabled(True)
+            self.connection_finished
         )
 
         self.worker.start()
 
-    def connected(self, _):
-        self.button.setText("Disconnect")
-        self.status.setText("Connected")
+    def connected(self):
+        self.machine.state.connected = True
+
+        self.connect_button.setText(
+            "Disconnect"
+        )
+
+        self.status.setText(
+            "Connected"
+        )
+
+        self.stateChanged.emit()
 
     def failed(self, message):
         self.machine.disconnect()
-        self.button.setText("Connect")
+
+        self.connect_button.setText(
+            "Connect"
+        )
+
         self.status.setText(
             f"Connection failed: {message}"
         )
+
+        self.stateChanged.emit()
+
+    def connection_finished(self):
+        self.connect_button.setEnabled(True)
+
+        worker = self.worker
+
+        if worker is not None:
+            worker.deleteLater()
+
+        self.worker = None
 
     def home(self, axis):
         try:
@@ -705,30 +373,99 @@ class MachinePanel(QFrame):
                 f"Error: {exc}"
             )
 
-    def zero(self):
+    def set_zero(self):
         try:
-            self.machine.zero()
+            if hasattr(
+                self.machine,
+                "set_zero",
+        profiles=None
+            ):
+                self.machine.set_zero()
+
+            elif hasattr(
+                self.machine,
+                "zero",
+            ):
+                self.machine.zero()
+
         except Exception as exc:
             self.status.setText(
                 f"Error: {exc}"
             )
 
     def update_state(self):
+        """Refresh the machine status without performing I/O."""
+
         state = self.machine.state
 
-        self.position.setText(
-            f"X: {state.x:.3f}\n"
-            f"Y: {state.y:.3f}\n"
-            f"Z: {state.z:.3f}\n"
-            f"F: {state.feed:.0f}"
+        connected = bool(
+            getattr(state, "connected", False)
         )
 
+        if connected:
+            state_text = getattr(
+                state,
+                "state",
+                "Connected",
+            )
 
-class JobList(QFrame):
-    selected = Signal(str)
+            self.status.setText(
+                str(state_text)
+            )
+
+            x = getattr(state, "x", 0.0)
+            y = getattr(state, "y", 0.0)
+            z = getattr(state, "z", 0.0)
+
+            try:
+                self.position.setText(
+                    f"X: {float(x):.3f}\n"
+                    f"Y: {float(y):.3f}\n"
+                    f"Z: {float(z):.3f}"
+                )
+            except (TypeError, ValueError):
+                self.position.setText(
+                    f"X: {x}\n"
+                    f"Y: {y}\n"
+                    f"Z: {z}"
+                )
+
+            self.connect_button.setText(
+                "Disconnect"
+            )
+
+        else:
+            self.status.setText(
+                str(
+                    getattr(
+                        state,
+                        "state",
+                        "Disconnected",
+                    )
+                )
+            )
+
+            self.position.setText(
+                "X: --\n"
+                "Y: --\n"
+                "Z: --"
+            )
+
+            self.connect_button.setText(
+                "Connect"
+            )
+
+
+
+class JobListPanel(QFrame):
     changed = Signal()
+    selected = Signal(str)
 
-    def __init__(self, jobs):
+    def __init__(
+        self,
+        jobs,
+    ):
+
         super().__init__()
 
         self.jobs = jobs
@@ -742,6 +479,7 @@ class JobList(QFrame):
         add = QPushButton(
             "Add SVG / G-code"
         )
+
         add.clicked.connect(
             self.add_file
         )
@@ -749,43 +487,88 @@ class JobList(QFrame):
         layout.addWidget(add)
 
         self.list = QListWidget()
+
         self.list.currentItemChanged.connect(
             self.selection_changed
         )
 
-        layout.addWidget(self.list)
+        layout.addWidget(
+            self.list
+        )
 
-        remove = QPushButton("Remove")
+        remove = QPushButton(
+            "Remove"
+        )
+
         remove.clicked.connect(
             self.remove
         )
 
         layout.addWidget(remove)
 
-    def refresh(self, selected=None):
-        self.list.blockSignals(True)
+    def refresh(
+        self,
+        selected_id=None,
+    ):
+
+        self.list.blockSignals(
+            True
+        )
+
         self.list.clear()
 
+        selected_item = None
+
         for job in self.jobs.jobs:
+
             item = QListWidgetItem()
 
-            text = job.name
+            item.setData(
+                Qt.UserRole,
+                job.id,
+            )
+
+            suffix = ""
 
             if (
                 job.source_type
                 == JobSourceType.GCODE
                 and job.stats
             ):
-                text += (
-                    f"  ·  "
-                    f"{fmt_time(job.stats.estimated_seconds)}"
+
+                suffix = (
+                    "  ·  "
+                    + format_duration(
+                        job.stats.get(
+                            "time",
+                            0,
+                        )
+                    )
+                )
+
+            text = (
+                job.name
+                + suffix
+            )
+
+            if (
+                not job.active
+                or not job.visible
+            ):
+
+                text = (
+                    "○ "
+                    + text
+                )
+
+            else:
+
+                text = (
+                    "● "
+                    + text
                 )
 
             item.setText(text)
-            item.setData(
-                Qt.UserRole,
-                job.id,
-            )
 
             item.setCheckState(
                 Qt.Checked
@@ -795,51 +578,93 @@ class JobList(QFrame):
 
             self.list.addItem(item)
 
-            if job.id == selected:
-                self.list.setCurrentItem(item)
+            if job.id == selected_id:
+                selected_item = item
 
-        self.list.blockSignals(False)
+        if selected_item:
 
-    def selection_changed(self, current, previous):
-        if current:
-            self.selected.emit(
-                current.data(Qt.UserRole)
+            self.list.setCurrentItem(
+                selected_item
             )
-        else:
+
+        self.list.blockSignals(
+            False
+        )
+
+    def selection_changed(
+        self,
+        current,
+        previous,
+    ):
+
+        if current is None:
+
             self.selected.emit("")
 
+            return
+
+        self.selected.emit(
+            current.data(
+                Qt.UserRole
+            )
+        )
+
     def add_file(self):
+
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Add Job",
             "",
-            "Plotter Files (*.svg *.gcode *.nc *.ngc)",
+            (
+                "Plotter files "
+                "(*.svg *.gcode *.nc *.ngc)"
+            ),
         )
 
+        selected_id = None
+
         for filename in files:
+
             try:
-                self.jobs.add_file(
+                job = self.jobs.add_file(
                     Path(filename)
                 )
+                selected_id = job.id
+
             except Exception as exc:
-                print(exc)
+
+                QMessageBox.warning(
+                    self,
+                    "Cannot add file",
+                    str(exc),
+                )
 
         self.changed.emit()
 
-    def remove(self):
-        item = self.list.currentItem()
+        if selected_id:
+            self.refresh(selected_id)
+            self.selected.emit(selected_id)
 
-        if not item:
+    def remove(self):
+
+        item = (
+            self.list.currentItem()
+        )
+
+        if item is None:
             return
 
         self.jobs.remove(
-            item.data(Qt.UserRole)
+            item.data(
+                Qt.UserRole
+            )
         )
 
         self.changed.emit()
 
 
-class JobProperties(QFrame):
+
+class JobPropertiesPanel(QFrame):
     changed = Signal()
     converted = Signal(str)
 
@@ -847,48 +672,53 @@ class JobProperties(QFrame):
         self,
         jobs,
         workspace,
-        profiles,
+        profiles=None,
+        preview=None,
     ):
         super().__init__()
 
         self.jobs = jobs
         self.workspace = workspace
-        self.profiles = profiles
-
+        self.preview = preview
+        self.profiles = profiles or []
         self.job = None
 
         layout = QVBoxLayout(self)
 
-        layout.addWidget(
-            QLabel("<b>Job Properties</b>")
-        )
+        title = QLabel("<b>Job Properties</b>")
+        layout.addWidget(title)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
 
-        content = QWidget()
+        self.content = QWidget()
         self.content_layout = QVBoxLayout(
-            content
+            self.content
         )
 
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
+        self.scroll.setWidget(
+            self.content
+        )
+
+        layout.addWidget(self.scroll)
 
         self.build_empty()
 
-    def clear(self):
+    def clear_layout(self):
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
 
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+
+            if widget:
+                widget.deleteLater()
 
     def build_empty(self):
-        self.clear()
+        self.clear_layout()
 
         self.content_layout.addWidget(
             QLabel(
-                "Select a job."
+                "Select a job to edit its properties."
             )
         )
 
@@ -897,16 +727,134 @@ class JobProperties(QFrame):
     def set_job(self, job_id):
         self.job = self.jobs.get(job_id)
 
-        if not self.job:
+        if self.job is None:
             self.build_empty()
             return
 
         self.build()
 
+    def _metric(self, name, value):
+        row = QHBoxLayout()
+
+        row.addWidget(
+            QLabel(name)
+        )
+
+        label = QLabel(value)
+        label.setAlignment(
+            Qt.AlignRight
+            | Qt.AlignVCenter
+        )
+
+        row.addWidget(label)
+
+        wrapper = QWidget()
+        wrapper.setLayout(row)
+
+        return wrapper
+
+    def _job_metrics(self, job):
+        if hasattr(self.jobs, "metrics"):
+            try:
+                return self.jobs.metrics(job)
+            except Exception:
+                pass
+
+        return {
+            "time": getattr(
+                job,
+                "estimated_time",
+                0.0,
+            ),
+            "draw_distance": getattr(
+                job,
+                "drawing_distance",
+                0.0,
+            ),
+            "travel_distance": getattr(
+                job,
+                "travel_distance",
+                0.0,
+            ),
+        }
+
+    def _format_time(self, seconds):
+        try:
+            seconds = float(seconds)
+        except Exception:
+            seconds = 0
+
+        if seconds < 60:
+            return f"{seconds:.1f} s"
+
+        minutes = int(seconds // 60)
+        remaining = int(seconds % 60)
+
+        if minutes < 60:
+            return f"{minutes}m {remaining:02d}s"
+
+        hours = minutes // 60
+        minutes %= 60
+
+        return f"{hours}h {minutes:02d}m"
+
     def build(self):
+
+        print(
+            "=== RUNTIME JobPropertiesPanel.build ==="
+        )
+        print(
+            "job:",
+            self.job,
+        )
+        print(
+            "job.source_type:",
+            repr(
+                getattr(
+                    self.job,
+                    "source_type",
+                    None,
+                )
+            ),
+        )
+        print(
+            "job.name:",
+            repr(
+                getattr(
+                    self.job,
+                    "name",
+                    None,
+                )
+            ),
+        )
+        print(
+            "job.source:",
+            repr(
+                getattr(
+                    self.job,
+                    "source",
+                    None,
+                )
+            ),
+        )
+        print(
+            "self.profiles:",
+            [
+                getattr(p, "name", repr(p))
+                for p in self.profiles
+            ],
+        )
         job = self.job
 
-        self.clear()
+        if job is None:
+            self.build_empty()
+            return
+
+        self.clear_layout()
+
+        # ----------------------------------------------------
+        # File
+        # ----------------------------------------------------
 
         file_group = QGroupBox("File")
         file_layout = QVBoxLayout(file_group)
@@ -915,320 +863,629 @@ class JobProperties(QFrame):
             QLabel(job.name)
         )
 
-        if job.source_type == JobSourceType.GCODE:
-            save = QPushButton("Save G-code")
-            save.clicked.connect(
-                self.save_gcode
-            )
-            file_layout.addWidget(save)
+        source_svg_id = getattr(
+            job,
+            "source_svg_id",
+            None,
+        )
+
+        if source_svg_id:
+            source = self.jobs.get(source_svg_id)
+
+            if source:
+                file_layout.addWidget(
+                    QLabel(
+                        f"Generated from SVG: {source.name}"
+                    )
+                )
 
         self.content_layout.addWidget(
             file_group
         )
 
-        if job.source_type == JobSourceType.SVG:
-            self.build_conversion()
-        else:
-            self.build_gcode_settings()
+        # ----------------------------------------------------
+        # G-code
+        # ----------------------------------------------------
 
-        self.build_placement()
-        self.build_transform()
+        is_gcode = (
+            str(
+                getattr(
+                    job,
+                    "source_type",
+                    "",
+                )
+            ).lower().endswith("gcode")
+        )
 
-        if job.source_type == JobSourceType.GCODE:
-            self.build_statistics()
-
-        self.content_layout.addStretch()
-
-    def build_conversion(self):
-        job = self.job
-
-        group = QGroupBox("Conversion")
-        layout = QVBoxLayout(group)
-
-        self.profile = QComboBox()
-
-        for profile in self.profiles.profiles:
-            self.profile.addItem(
-                profile.name,
-                profile,
+        if is_gcode:
+            save = QPushButton(
+                "Save G-code..."
             )
 
-        layout.addWidget(
-            QLabel("Profile")
+            save.clicked.connect(
+                self.save_gcode
+            )
+
+            self.content_layout.addWidget(save)
+
+        # ----------------------------------------------------
+        # Active
+        # ----------------------------------------------------
+
+        active = QCheckBox("Active")
+        active.setChecked(
+            getattr(
+                job,
+                "active",
+                True,
+            )
         )
-        layout.addWidget(self.profile)
 
-        parameter_widget = QWidget()
-        parameter_layout = QVBoxLayout(
-            parameter_widget
+        active.toggled.connect(
+            self.update_active
         )
 
-        self.parameter_widgets = {}
+        self.content_layout.addWidget(active)
 
-        def rebuild(index):
-            while parameter_layout.count():
-                item = parameter_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+        # ----------------------------------------------------
+        # ----------------------------------------------------
+        # Conversion
+        # ----------------------------------------------------
 
-            self.parameter_widgets.clear()
+        source_type = str(
+            getattr(
+                job,
+                "source_type",
+                "",
+            )
+        ).lower()
 
-            profile = self.profile.currentData()
+        # A conversion profile is available whenever the current
+        # job represents an SVG source. Different parts of PlotPilot
+        # may identify the source using source_type or the source
+        # filename, so accept both representations.
+        source_path = getattr(
+            job,
+            "source",
+            None,
+        )
 
-            if not profile:
-                return
+        source_name = str(
+            getattr(
+                job,
+                "name",
+                "",
+            )
+        ).lower()
 
-            for parameter in profile.parameters:
-                row = QHBoxLayout()
+        source_file = str(
+            source_path or ""
+        ).lower()
 
-                row.addWidget(
-                    QLabel(
-                        parameter.description
-                        or parameter.name
-                    )
+        is_svg = (
+            source_type.endswith("svg")
+            or source_name.endswith(".svg")
+            or source_file.endswith(".svg")
+        )
+
+        print(
+            "JobPropertiesPanel SVG detection:",
+            {
+                "source_type": source_type,
+                "name": source_name,
+                "source": source_file,
+                "is_svg": is_svg,
+                "profiles": [
+                    profile.name
+                    for profile in self.profiles
+                ],
+            }
+        )
+
+        print(
+            "=== RUNTIME SVG CONVERSION CHECK ==="
+        )
+        print(
+            "is_svg:",
+            is_svg,
+        )
+        print(
+            "profiles:",
+            [
+                getattr(p, "name", repr(p))
+                for p in self.profiles
+            ],
+        )
+
+        if is_svg:
+            conversion = QGroupBox(
+                "SVG → G-code"
+            )
+
+            conversion_layout = QVBoxLayout(
+                conversion
+            )
+
+            profile_row = QHBoxLayout()
+
+            profile_row.addWidget(
+                QLabel("Profile")
+            )
+
+            self.profile_combo = QComboBox()
+
+            current_profile = getattr(
+                self.job,
+                "conversion_profile",
+                None,
+            )
+
+            selected_index = -1
+
+            for index, profile in enumerate(
+                self.profiles
+            ):
+                self.profile_combo.addItem(
+                    profile.name,
+                    profile,
                 )
 
-                if parameter.type == "boolean":
-                    widget = QCheckBox()
-                    widget.setChecked(
-                        bool(parameter.default)
-                    )
+                if profile.name == current_profile:
+                    selected_index = index
 
-                elif parameter.type == "integer":
-                    widget = QSpinBox()
-                    widget.setRange(
-                        int(parameter.minimum or -1000000),
-                        int(parameter.maximum or 1000000),
-                    )
-                    widget.setValue(
-                        int(parameter.default or 0)
-                    )
-
-                elif parameter.type == "number":
-                    widget = QDoubleSpinBox()
-                    widget.setRange(
-                        float(
-                            parameter.minimum
-                            if parameter.minimum is not None
-                            else -1000000
-                        ),
-                        float(
-                            parameter.maximum
-                            if parameter.maximum is not None
-                            else 1000000
-                        ),
-                    )
-                    widget.setDecimals(4)
-                    widget.setValue(
-                        float(parameter.default or 0)
-                    )
-
-                elif parameter.type == "choice":
-                    widget = QComboBox()
-
-                    for choice in parameter.choices:
-                        widget.addItem(choice)
-
-                    if parameter.default in parameter.choices:
-                        widget.setCurrentText(
-                            parameter.default
-                        )
-
-                else:
-                    widget = QLineEdit(
-                        "" if parameter.default is None
-                        else str(parameter.default)
-                    )
-
-                self.parameter_widgets[
-                    parameter.name
-                ] = widget
-
-                row.addWidget(widget)
-                parameter_layout.addLayout(row)
-
-        self.profile.currentIndexChanged.connect(
-            rebuild
-        )
-
-        rebuild(0)
-
-        collapsed = Collapsible(
-            "Parameters",
-            parameter_widget,
-            expanded=False,
-        )
-
-        layout.addWidget(collapsed)
-
-        convert = QPushButton(
-            "Convert to G-code"
-        )
-
-        convert.clicked.connect(
-            self.convert
-        )
-
-        layout.addWidget(convert)
-
-        self.content_layout.addWidget(group)
-
-    def build_gcode_settings(self):
-        job = self.job
-
-        group = QGroupBox("Preview")
-        layout = QVBoxLayout(group)
-
-        self.preview_limit = QSpinBox()
-        self.preview_limit.setRange(
-            1000,
-            10000000,
-        )
-        self.preview_limit.setValue(
-            job.preview_limit
-        )
-
-        self.preview_limit.valueChanged.connect(
-            self.preview_changed
-        )
-
-        row = QHBoxLayout()
-        row.addWidget(
-            QLabel("Max instructions")
-        )
-        row.addWidget(
-            self.preview_limit
-        )
-
-        layout.addLayout(row)
-
-        self.preview_mode = QComboBox()
-
-        self.preview_mode.addItems([
-            "Auto",
-            "Full",
-            "Simplified",
-        ])
-
-        self.preview_mode.setCurrentText(
-            job.preview_mode.title()
-        )
-
-        self.preview_mode.currentTextChanged.connect(
-            self.preview_changed
-        )
-
-        row = QHBoxLayout()
-        row.addWidget(
-            QLabel("Mode")
-        )
-        row.addWidget(
-            self.preview_mode
-        )
-
-        layout.addLayout(row)
-
-        self.content_layout.addWidget(group)
-
-    def build_placement(self):
-        job = self.job
-
-        group = QGroupBox("Placement")
-        layout = QVBoxLayout(group)
-
-        self.origin = QComboBox()
-
-        self.origin.addItem(
-            "Machine Origin",
-            "machine",
-        )
-
-        for anchor in self.workspace.anchors:
-            self.origin.addItem(
-                anchor.name,
-                anchor.name,
+            print(
+                "MachinePanel conversion profiles:",
+                [profile.name for profile in self.profiles],
             )
 
-        index = self.origin.findData(
-            job.origin
+            print(
+                "=== RUNTIME PROFILE COMBO ==="
+            )
+            print(
+                "combo count:",
+                self.profile_combo.count(),
+            )
+            print(
+                "combo items:",
+                [
+                    self.profile_combo.itemText(i)
+                    for i in range(
+                        self.profile_combo.count()
+                    )
+                ],
+            )
+
+
+            if selected_index >= 0:
+                self.profile_combo.setCurrentIndex(
+                    selected_index
+                )
+
+            self.profile_combo.currentIndexChanged.connect(
+                self.profile_changed
+            )
+
+            profile_row.addWidget(
+                self.profile_combo
+            )
+
+            conversion_layout.addLayout(
+                profile_row
+            )
+
+            params = QWidget()
+            params_layout = QVBoxLayout(
+                params
+            )
+
+            self.parameter_widgets = {}
+
+            def rebuild_parameters():
+                while params_layout.count():
+                    item = params_layout.takeAt(0)
+
+                    widget = item.widget()
+
+                    if widget:
+                        widget.deleteLater()
+
+                profile = (
+                    self.profile_combo.currentData()
+                    if self.profile_combo.count()
+                    else None
+                )
+
+                parameters = getattr(
+                    profile,
+                    "parameters",
+                    [],
+                )
+
+                # Conversion profiles discovered from .sh --json
+                # expose parameters as ProfileParameter objects.
+                # Normalize them here so the UI does not care whether
+                # the profile manager uses objects or dictionaries.
+                normalized_parameters = []
+
+                if isinstance(parameters, dict):
+                    for name, specification in parameters.items():
+                        if isinstance(specification, dict):
+                            normalized_parameters.append(
+                                (
+                                    str(name),
+                                    specification,
+                                )
+                            )
+                        else:
+                            normalized_parameters.append(
+                                (
+                                    str(name),
+                                    {
+                                        "type": "string",
+                                        "default": specification,
+                                    },
+                                )
+                            )
+
+                elif isinstance(parameters, list):
+                    for parameter in parameters:
+                        name = getattr(
+                            parameter,
+                            "name",
+                            None,
+                        )
+
+                        if not name:
+                            continue
+
+                        normalized_parameters.append(
+                            (
+                                str(name),
+                                {
+                                    "type": getattr(
+                                        parameter,
+                                        "type",
+                                        "string",
+                                    ),
+                                    "default": getattr(
+                                        parameter,
+                                        "default",
+                                        None,
+                                    ),
+                                    "description": getattr(
+                                        parameter,
+                                        "description",
+                                        "",
+                                    ),
+                                    "minimum": getattr(
+                                        parameter,
+                                        "minimum",
+                                        None,
+                                    ),
+                                    "maximum": getattr(
+                                        parameter,
+                                        "maximum",
+                                        None,
+                                    ),
+                                    "options": getattr(
+                                        parameter,
+                                        "options",
+                                        [],
+                                    ),
+                                },
+                            )
+                        )
+
+                self.parameter_widgets.clear()
+
+                for name, specification in normalized_parameters:
+                    row = QHBoxLayout()
+
+                    row.addWidget(
+                        QLabel(str(name))
+                    )
+
+                    value = specification.get(
+                        "default"
+                    )
+
+                    parameter_type = str(
+                        specification.get(
+                            "type",
+                            "string",
+                        )
+                    ).lower()
+
+                    if parameter_type == "boolean":
+                        value = bool(value)
+
+                    elif parameter_type == "number":
+                        try:
+                            value = float(
+                                1.0 if value is None else value
+                            )
+                        except (TypeError, ValueError):
+                            value = 1.0
+
+                    elif parameter_type == "integer":
+                        try:
+                            value = int(
+                                0 if value is None else value
+                            )
+                        except (TypeError, ValueError):
+                            value = 0
+
+                    elif value is None:
+                        value = ""
+
+                    if parameter_type == "boolean":
+                        widget = QCheckBox()
+                        widget.setChecked(value)
+
+                    elif parameter_type == "integer":
+                        widget = QSpinBox()
+
+                        if isinstance(
+                            specification,
+                            dict,
+                        ):
+                            if specification.get("minimum") is not None:
+                                widget.setMinimum(
+                                    int(
+                                        specification[
+                                            "minimum"
+                                        ]
+                                    )
+                                )
+
+                            if specification.get("maximum") is not None:
+                                widget.setMaximum(
+                                    int(
+                                        specification[
+                                            "maximum"
+                                        ]
+                                    )
+                                )
+
+                        widget.setValue(value)
+
+                    elif parameter_type == "number":
+                        widget = QDoubleSpinBox()
+
+                        if isinstance(
+                            specification,
+                            dict,
+                        ):
+                            if specification.get("minimum") is not None:
+                                widget.setMinimum(
+                                    float(
+                                        specification[
+                                            "minimum"
+                                        ]
+                                    )
+                                )
+
+                            if specification.get("maximum") is not None:
+                                widget.setMaximum(
+                                    float(
+                                        specification[
+                                            "maximum"
+                                        ]
+                                    )
+                                )
+
+                        widget.setValue(value)
+
+                    else:
+                        choices = specification.get(
+                            "options",
+                            specification.get(
+                                "choices",
+                                [],
+                            ),
+                        )
+
+                        if choices:
+                            widget = QComboBox()
+                            widget.addItems(
+                                [
+                                    str(choice)
+                                    for choice in choices
+                                ]
+                            )
+
+                            if value is not None:
+                                current = widget.findText(
+                                    str(value)
+                                )
+
+                                if current >= 0:
+                                    widget.setCurrentIndex(
+                                        current
+                                    )
+                        else:
+                            widget = QLineEdit(
+                                "" if value is None
+                                else str(value)
+                            )
+
+                    self.parameter_widgets[
+                        str(name)
+                    ] = widget
+
+                    row.addWidget(
+                        widget
+                    )
+
+                    params_layout.addLayout(
+                        row
+                    )
+
+            self.profile_combo.currentIndexChanged.connect(
+                lambda _index: rebuild_parameters()
+            )
+
+            conversion_layout.addWidget(
+                params
+            )
+
+            rebuild_parameters()
+
+            self.content_layout.addWidget(
+                conversion
+            )
+
+
+        # ----------------------------------------------------
+        # Placement
+        # ----------------------------------------------------
+
+        placement = QGroupBox(
+            "Placement"
         )
 
-        if index >= 0:
-            self.origin.setCurrentIndex(index)
-
-        self.origin.currentIndexChanged.connect(
-            self.placement_changed
+        placement_layout = QVBoxLayout(
+            placement
         )
 
-        layout.addWidget(
-            QLabel("Origin")
-        )
-        layout.addWidget(self.origin)
+        self.origin_checks = []
 
-        self.repeat = QCheckBox(
-            "Repeat on anchors"
-        )
-
-        self.repeat.setChecked(
-            job.repeat_anchors
+        # Machine origin is explicitly represented as one of
+        # the placement options and is selected by default.
+        machine_check = QCheckBox(
+            "Machine Origin"
         )
 
-        self.repeat.toggled.connect(
-            self.placement_changed
+        machine_check.setChecked(
+            getattr(
+                job,
+                "origin",
+                "machine",
+            ) == "machine"
         )
 
-        layout.addWidget(self.repeat)
+        machine_check.toggled.connect(
+            lambda checked:
+            self.origin_toggled(
+                "machine",
+                checked,
+            )
+        )
 
-        self.anchor_checks = []
+        placement_layout.addWidget(
+            machine_check
+        )
+
+        self.origin_checks.append(
+            ("machine", machine_check)
+        )
 
         for anchor in self.workspace.anchors:
             check = QCheckBox(anchor.name)
 
             check.setChecked(
-                anchor.name
-                in job.repeated_anchors
-            )
-
-            check.setVisible(
-                job.repeat_anchors
+                getattr(
+                    job,
+                    "origin",
+                    "machine",
+                ) == anchor.name
             )
 
             check.toggled.connect(
-                self.placement_changed
+                lambda checked,
+                name=anchor.name:
+                self.origin_toggled(
+                    name,
+                    checked,
+                )
             )
 
-            self.anchor_checks.append(
-                (anchor.name, check)
+            placement_layout.addWidget(check)
+
+            self.origin_checks.append(
+                (
+                    anchor.name,
+                    check,
+                )
             )
 
-            layout.addWidget(check)
+        select_row = QHBoxLayout()
 
-        self.content_layout.addWidget(group)
+        select_all = QPushButton(
+            "Select all"
+        )
 
-    def build_transform(self):
-        job = self.job
+        deselect_all = QPushButton(
+            "Deselect all"
+        )
 
-        group = QGroupBox("Transform")
-        layout = QVBoxLayout(group)
+        select_all.clicked.connect(
+            lambda:
+            self.set_all_anchors(True)
+        )
 
-        self.x = self.number(
-            "X offset",
+        deselect_all.clicked.connect(
+            lambda:
+            self.set_all_anchors(False)
+        )
+
+        select_row.addWidget(select_all)
+        select_row.addWidget(deselect_all)
+
+        placement_layout.addLayout(
+            select_row
+        )
+
+        self.content_layout.addWidget(
+            placement
+        )
+
+        # ----------------------------------------------------
+        # Transform
+        # ----------------------------------------------------
+
+        transform = QGroupBox(
+            "Transform"
+        )
+
+        transform_layout = QVBoxLayout(
+            transform
+        )
+
+        self.offset_x = self.number(
+            "Offset X",
             job.transform.offset_x,
+            self.update_offset,
         )
 
-        self.y = self.number(
-            "Y offset",
+        self.offset_y = self.number(
+            "Offset Y",
             job.transform.offset_y,
+            self.update_offset,
         )
 
-        self.z = self.number(
-            "Z offset",
+        self.offset_z = self.number(
+            "Offset Z",
             job.transform.offset_z,
+            self.update_offset,
+        )
+
+        transform_layout.addWidget(
+            self.offset_x[0]
+        )
+
+        transform_layout.addWidget(
+            self.offset_y[0]
+        )
+
+        transform_layout.addWidget(
+            self.offset_z[0]
         )
 
         self.scale = self.number(
             "Scale",
             job.transform.scale,
+            self.update_scale,
             minimum=0.001,
             maximum=1000,
             decimals=4,
@@ -1237,359 +1494,675 @@ class JobProperties(QFrame):
         self.rotation = self.number(
             "Rotation",
             job.transform.rotation,
+            self.update_rotation,
             minimum=-360,
             maximum=360,
         )
 
-        for widget, spin in (
-            self.x,
-            self.y,
-            self.z,
-            self.scale,
-            self.rotation,
-        ):
-            spin.valueChanged.connect(
-                self.transform_changed
-            )
-            layout.addWidget(widget)
-
-        self.flip_x = QCheckBox("Flip X")
-        self.flip_y = QCheckBox("Flip Y")
-
-        self.flip_x.setChecked(
-            job.transform.flip_x
+        transform_layout.addWidget(
+            self.scale[0]
         )
 
-        self.flip_y.setChecked(
-            job.transform.flip_y
+        transform_layout.addWidget(
+            self.rotation[0]
         )
 
-        self.flip_x.toggled.connect(
-            self.transform_changed
-        )
-
-        self.flip_y.toggled.connect(
-            self.transform_changed
-        )
-
-        layout.addWidget(self.flip_x)
-        layout.addWidget(self.flip_y)
-
-        self.content_layout.addWidget(group)
-
-    def build_statistics(self):
-        stats = self.job.stats
-
-        if not stats:
-            return
-
-        group = QGroupBox("Statistics")
-        layout = QVBoxLayout(group)
-
-        layout.addWidget(
-            QLabel(
-                f"Total time: "
-                f"{fmt_time(stats.estimated_seconds)}"
+        transform_layout.addWidget(
+            self.make_flip(
+                "Flip X",
+                job.transform.flip_x,
+                self.update_flip_x,
             )
         )
 
-        layout.addWidget(
-            QLabel(
-                f"Drawing distance: "
-                f"{stats.drawing_distance:.1f} mm"
+        transform_layout.addWidget(
+            self.make_flip(
+                "Flip Y",
+                job.transform.flip_y,
+                self.update_flip_y,
             )
         )
 
-        layout.addWidget(
-            QLabel(
-                f"Travel distance: "
-                f"{stats.travel_distance:.1f} mm"
+        # New variants: flip geometry while preserving its
+        # bounding-box position.
+        transform_layout.addWidget(
+            self.make_flip(
+                "Flip X — keep bounding box",
+                getattr(
+                    job.transform,
+                    "flip_x_keep_bbox",
+                    False,
+                ),
+                self.update_flip_x_keep_bbox,
             )
         )
 
-        layout.addWidget(
-            QLabel(
-                f"Drawing moves: "
-                f"{stats.drawing_moves}"
+        transform_layout.addWidget(
+            self.make_flip(
+                "Flip Y — keep bounding box",
+                getattr(
+                    job.transform,
+                    "flip_y_keep_bbox",
+                    False,
+                ),
+                self.update_flip_y_keep_bbox,
             )
         )
 
-        layout.addWidget(
-            QLabel(
-                f"Travel moves: "
-                f"{stats.travel_moves}"
+        self.content_layout.addWidget(
+            transform
+        )
+
+        # ----------------------------------------------------
+        # Preview
+        # ----------------------------------------------------
+
+        preview = QGroupBox(
+            "Preview"
+        )
+
+        preview_layout = QVBoxLayout(
+            preview
+        )
+
+        limit_row = QHBoxLayout()
+
+        limit_row.addWidget(
+            QLabel("Instruction limit")
+        )
+
+        self.preview_limit = QSpinBox()
+        self.preview_limit.setRange(
+            100,
+            1000000,
+        )
+
+        self.preview_limit.setValue(
+            getattr(
+                self.workspace,
+                "preview_limit",
+                20000,
             )
         )
 
-        self.content_layout.addWidget(group)
+        self.preview_limit.valueChanged.connect(
+            self.preview_limit_changed
+        )
+
+        limit_row.addWidget(
+            self.preview_limit
+        )
+
+        preview_layout.addLayout(
+            limit_row
+        )
+
+        drawing = QCheckBox(
+            "Show drawing moves"
+        )
+
+        drawing.setChecked(
+            getattr(
+                self.workspace,
+                "show_drawing",
+                True,
+            )
+        )
+
+        drawing.toggled.connect(
+            self.preview_drawing_changed
+        )
+
+        travel = QCheckBox(
+            "Show travel moves"
+        )
+
+        travel.setChecked(
+            self.preview.show_travel
+        )
+
+        travel.toggled.connect(
+            self.preview_travel_changed
+        )
+
+        preview_layout.addWidget(drawing)
+        preview_layout.addWidget(travel)
+
+        self.content_layout.addWidget(
+            preview
+        )
+
+        # ----------------------------------------------------
+        # Metrics
+        # ----------------------------------------------------
+
+        metrics = QGroupBox(
+            "G-code information"
+        )
+
+        metrics_layout = QVBoxLayout(
+            metrics
+        )
+
+        data = self._job_metrics(job)
+
+        metrics_layout.addWidget(
+            self._metric(
+                "Total time",
+                self._format_time(
+                    data.get("time", 0)
+                ),
+            )
+        )
+
+        metrics_layout.addWidget(
+            self._metric(
+                "Drawing distance",
+                f"{data.get('draw_distance', 0):.1f} mm",
+            )
+        )
+
+        metrics_layout.addWidget(
+            self._metric(
+                "Travel distance",
+                f"{data.get('travel_distance', 0):.1f} mm",
+            )
+        )
+
+        self.content_layout.addWidget(
+            metrics
+        )
+
+        self.content_layout.addStretch()
+
+    # --------------------------------------------------------
+    # Controls
+    # --------------------------------------------------------
 
     def number(
         self,
         label,
         value,
-        minimum=-1000000,
-        maximum=1000000,
+        callback,
+        minimum=-100000,
+        maximum=100000,
         decimals=2,
     ):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        layout.addWidget(QLabel(label))
+        layout.addWidget(
+            QLabel(label)
+        )
 
         spin = QDoubleSpinBox()
-        spin.setRange(minimum, maximum)
+        spin.setRange(
+            minimum,
+            maximum,
+        )
         spin.setDecimals(decimals)
         spin.setValue(value)
+
+        spin.valueChanged.connect(callback)
 
         layout.addWidget(spin)
 
         return row, spin
 
-    def placement_changed(self):
+    def make_flip(
+        self,
+        label,
+        checked,
+        callback,
+    ):
+        check = QCheckBox(label)
+        check.setChecked(checked)
+        check.toggled.connect(callback)
+        return check
+
+    def profile_changed(self, index):
         if not self.job:
             return
 
-        self.job.origin = (
-            self.origin.currentData()
+        profile = self.profile_combo.itemData(
+            index
         )
 
-        self.job.repeat_anchors = (
-            self.repeat.isChecked()
-        )
-
-        self.job.repeated_anchors = [
-            name
-            for name, check
-            in self.anchor_checks
-            if check.isChecked()
-        ]
-
-        for _, check in self.anchor_checks:
-            check.setVisible(
-                self.job.repeat_anchors
+        if profile is None:
+            self.job.conversion_profile = None
+            self.job.conversion_parameters = {}
+        else:
+            self.job.conversion_profile = (
+                profile.name
             )
 
+            parameters = getattr(
+                profile,
+                "parameters",
+                [],
+            )
+
+            values = {}
+
+            for name, widget in getattr(
+                self,
+                "parameter_widgets",
+                {},
+            ).items():
+                try:
+                    if isinstance(
+                        widget,
+                        QCheckBox,
+                    ):
+                        values[name] = (
+                            widget.isChecked()
+                        )
+
+                    elif isinstance(
+                        widget,
+                        QComboBox,
+                    ):
+                        values[name] = (
+                            widget.currentText()
+                        )
+
+                    elif isinstance(
+                        widget,
+                        QSpinBox,
+                    ):
+                        values[name] = (
+                            widget.value()
+                        )
+
+                    elif isinstance(
+                        widget,
+                        QDoubleSpinBox,
+                    ):
+                        values[name] = (
+                            widget.value()
+                        )
+
+                    elif isinstance(
+                        widget,
+                        QLineEdit,
+                    ):
+                        values[name] = (
+                            widget.text()
+                        )
+
+                except RuntimeError:
+                    pass
+
+            self.job.conversion_parameters = values
+
         self.changed.emit()
 
-    def transform_changed(self):
+    def update_active(self, value):
+        if self.job:
+            self.job.active = value
+            self.changed.emit()
+
+    def origin_toggled(self, name, checked):
+        if not self.job or not checked:
+            return
+
+        for other_name, check in self.origin_checks:
+            if other_name != name:
+                check.blockSignals(True)
+                check.setChecked(False)
+                check.blockSignals(False)
+
+        self.job.origin = name
+
+        self.changed.emit()
+
+    def set_all_anchors(self, enabled):
+        """
+        Selecting all anchors means machine origin plus every
+        anchor is enabled as a repeated placement.
+
+        Machine origin remains the primary origin.
+        """
+
         if not self.job:
             return
 
-        self.job.transform.offset_x = (
-            self.x[1].value()
-        )
+        machine = self.origin_checks[0][1]
 
-        self.job.transform.offset_y = (
-            self.y[1].value()
-        )
+        machine.blockSignals(True)
+        machine.setChecked(True)
+        machine.blockSignals(False)
 
-        self.job.transform.offset_z = (
-            self.z[1].value()
-        )
+        self.job.origin = "machine"
 
-        self.job.transform.scale = (
-            self.scale[1].value()
-        )
+        names = []
 
-        self.job.transform.rotation = (
-            self.rotation[1].value()
-        )
+        for name, check in self.origin_checks[1:]:
+            check.blockSignals(True)
+            check.setChecked(enabled)
+            check.blockSignals(False)
 
-        self.job.transform.flip_x = (
-            self.flip_x.isChecked()
-        )
+            if enabled:
+                names.append(name)
 
-        self.job.transform.flip_y = (
-            self.flip_y.isChecked()
-        )
+        self.job.repeated_anchors = names
 
         self.changed.emit()
 
-    def preview_changed(self):
-        if not self.job:
-            return
+    def update_offset(self):
+        if self.job:
+            self.job.transform.offset_x = (
+                self.offset_x[1].value()
+            )
 
-        self.job.preview_limit = (
-            self.preview_limit.value()
-        )
+            self.job.transform.offset_y = (
+                self.offset_y[1].value()
+            )
 
-        self.job.preview_mode = (
-            self.preview_mode.currentText().lower()
-        )
+            self.job.transform.offset_z = (
+                self.offset_z[1].value()
+            )
 
-        self.changed.emit()
+            self.changed.emit()
 
-    def convert(self):
-        if not self.job:
-            return
+    def update_scale(self):
+        if self.job:
+            self.job.transform.scale = (
+                self.scale[1].value()
+            )
+            self.changed.emit()
 
-        profile = self.profile.currentData()
+    def update_rotation(self):
+        if self.job:
+            self.job.transform.rotation = (
+                self.rotation[1].value()
+            )
+            self.changed.emit()
 
-        if not profile:
-            return
+    def update_flip_x(self, value):
+        if self.job:
+            self.job.transform.flip_x = value
+            self.changed.emit()
 
-        parameters = {}
+    def update_flip_y(self, value):
+        if self.job:
+            self.job.transform.flip_y = value
+            self.changed.emit()
 
-        for name, widget in (
-            self.parameter_widgets.items()
-        ):
+    def update_flip_x_keep_bbox(self, value):
+        if self.job:
+            self.job.transform.flip_x_keep_bbox = value
+            self.changed.emit()
+
+    def update_flip_y_keep_bbox(self, value):
+        if self.job:
+            self.job.transform.flip_y_keep_bbox = value
+            self.changed.emit()
+
+    def preview_limit_changed(self, value):
+        self.preview.preview_limit = value
+        self.workspace.update()
+
+    def preview_drawing_changed(self, value):
+        self.preview.show_drawing = value
+        self.workspace.update()
+
+    def preview_travel_changed(self, value):
+        self.preview.show_travel = value
+        self.workspace.update()
+
+    # --------------------------------------------------------
+    # Conversion / save
+    # --------------------------------------------------------
+
+    def _parameters(self):
+        result = {}
+
+        for name, widget in getattr(
+            self,
+            "parameter_widgets",
+            {},
+        ).items():
             if isinstance(widget, QCheckBox):
-                value = widget.isChecked()
+                result[name] = widget.isChecked()
+
+            elif isinstance(widget, QDoubleSpinBox):
+                result[name] = widget.value()
+
+            elif isinstance(widget, QSpinBox):
+                result[name] = widget.value()
 
             elif isinstance(widget, QComboBox):
-                value = widget.currentText()
+                result[name] = widget.currentText()
 
-            elif isinstance(
-                widget,
-                (
-                    QSpinBox,
-                    QDoubleSpinBox,
-                ),
-            ):
-                value = widget.value()
+            elif isinstance(widget, QLineEdit):
+                result[name] = widget.text()
 
-            else:
-                value = widget.text()
+        return result
 
-            parameters[name] = value
+    def convert_to_gcode(self):
+        if not self.job:
+            return
 
-        output = Path(
-            tempfile.mktemp(
-                prefix="plotpilot-",
-                suffix=".gcode",
-            )
-        )
+        if not hasattr(self, "profile_combo"):
+            return
 
-        command = [
-            str(profile.path),
-            "--input",
-            str(self.job.source),
-            "--output",
-            str(output),
-        ]
+        profile = self.profile_combo.currentData()
 
-        for name, value in parameters.items():
-            if isinstance(value, bool):
-                if value:
-                    command.append(
-                        f"--{name}"
-                    )
-            else:
-                command.extend([
-                    f"--{name}",
-                    str(value),
-                ])
+        if profile is None:
+            return
+
+        parameters = self._parameters()
 
         try:
-            subprocess.run(
-                command,
-                check=True,
-                timeout=300,
-            )
+            if hasattr(
+                self.jobs,
+                "convert_svg",
+            ):
+                new_job = self.jobs.convert_svg(
+                    self.job,
+                    profile,
+                    parameters,
+                )
+
+            else:
+                raise RuntimeError(
+                    "JobManager does not provide convert_svg()"
+                )
 
             self.converted.emit(
-                str(output)
+                new_job.id
             )
 
         except Exception as exc:
-            self.status_message(
-                f"Conversion failed: {exc}"
+            QMessageBox.critical(
+                self,
+                "Conversion failed",
+                str(exc),
             )
 
-    def status_message(self, text):
-        print(text)
-
     def save_gcode(self):
-        if not self.job or not self.job.gcode:
+        if not self.job:
             return
+
+        gcode = getattr(
+            self.job,
+            "gcode",
+            None,
+        )
+
+        if not gcode:
+            try:
+                gcode = Path(
+                    self.job.source
+                ).read_text(
+                    encoding="utf-8"
+                )
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Save failed",
+                    str(exc),
+                )
+                return
 
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save G-code",
             self.job.name,
-            "G-code (*.gcode *.nc *.ngc)",
+            "G-code (*.gcode *.nc *.ngc);;All files (*)",
         )
 
         if not filename:
             return
 
-        Path(filename).write_text(
-            self.job.gcode,
-            encoding="utf-8",
-        )
+        try:
+            Path(filename).write_text(
+                gcode,
+                encoding="utf-8",
+            )
+
+            self.job.source = Path(filename)
+            self.job.name = Path(filename).name
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                str(exc),
+            )
+
 
 
 class MainWindow(QMainWindow):
+
     def __init__(
         self,
         config,
     ):
+
         super().__init__()
 
-        self.setWindowTitle("PlotPilot")
-        self.resize(1500, 850)
-
-        self.machine = __import__(
-            "plotpilot.machine",
-            fromlist=["FluidNC"],
-        ).FluidNC(
-            config.host,
-            config.port,
+        self.setWindowTitle(
+            "PlotPilot"
         )
 
-        from .jobs import JobManager
+        self.resize(
+            1500,
+            900,
+        )
 
-        self.jobs = JobManager()
+        self.machine = (
+            FluidNCController(
+                config.host,
+                config.port,
+            )
+        )
 
-        self.profiles = ProfileManager(
+        self.workspace_config = (
+            config.workspace
+        )
+
+        self.profiles = (
             config.profiles
         )
 
-        self.profiles.discover()
+        self.jobs = JobManager()
 
-        self.machine_panel = MachinePanel(
-            self.machine
+        # ----------------------------------------------------
+        # Panels
+        # ----------------------------------------------------
+
+        self.machine_panel = (
+            MachinePanel(
+                self.machine,
+                profiles=self.profiles,
+            )
         )
 
-        self.job_list = JobList(
-            self.jobs
+        self.job_list = (
+            JobListPanel(
+                self.jobs
+            )
         )
 
-        self.workspace = WorkspaceView(
-            config.workspace,
-            self.jobs,
+        self.workspace = (
+            WorkspaceView(
+                config.workspace,
+                self.jobs,
+            )
         )
 
-        self.properties = JobProperties(
-            self.jobs,
-            config.workspace,
-            self.profiles,
+        self.properties = (
+            JobPropertiesPanel(
+                self.jobs,
+                config.workspace,
+                self.profiles,
+                self.workspace,
+            )
         )
+
+        # ----------------------------------------------------
+        # Layout
+        # ----------------------------------------------------
 
         left = QWidget()
-        left_layout = QVBoxLayout(left)
+
+        left_layout = QVBoxLayout(
+            left
+        )
+
         left_layout.addWidget(
             self.machine_panel
         )
+
         left_layout.addWidget(
             self.job_list
         )
 
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter(
+            Qt.Horizontal
+        )
+
         splitter.addWidget(left)
-        splitter.addWidget(self.workspace)
-        splitter.addWidget(self.properties)
+        splitter.addWidget(
+            self.workspace
+        )
+        splitter.addWidget(
+            self.properties
+        )
 
-        splitter.setSizes([
-            300,
-            900,
-            360,
-        ])
+        splitter.setSizes(
+            [
+                300,
+                900,
+                350,
+            ]
+        )
 
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(
+            0,
+            0,
+        )
 
-        self.setCentralWidget(splitter)
+        splitter.setStretchFactor(
+            1,
+            1,
+        )
+
+        splitter.setStretchFactor(
+            2,
+            0,
+        )
+
+        self.setCentralWidget(
+            splitter
+        )
+
+        # ----------------------------------------------------
+        # Signals
+        # ----------------------------------------------------
 
         self.job_list.selected.connect(
             self.select_job
@@ -1599,166 +2172,184 @@ class MainWindow(QMainWindow):
             self.refresh
         )
 
-        self.workspace.selected.connect(
+        self.workspace.jobSelected.connect(
             self.select_job
         )
 
-        self.workspace.moved.connect(
-            lambda _: self.refresh_workspace()
+        self.workspace.jobMoved.connect(
+            self.workspace_job_moved
+        )
+
+        self.workspace.moveMachineRequested.connect(
+            self.move_machine
         )
 
         self.properties.changed.connect(
-            self.refresh_workspace
+            self.refresh
         )
 
         self.properties.converted.connect(
             self.conversion_finished
         )
 
-        from PySide6.QtCore import QTimer
+        # ----------------------------------------------------
+        # Status polling
+        # ----------------------------------------------------
 
         self.timer = QTimer(self)
+
+        self.timer.setInterval(
+            250
+        )
+
         self.timer.timeout.connect(
             self.update_machine
         )
-        self.timer.start(250)
+
+        self.timer.start()
 
         self.job_list.refresh()
 
-    def refresh_workspace(self):
+    def refresh(self):
+
+        selected = None
+
+        if self.properties.job:
+
+            selected = (
+                self.properties.job.id
+            )
+
         self.workspace.update()
 
-    def refresh(self):
-        selected = (
-            self.properties.job.id
-            if self.properties.job
-            else None
+        self.job_list.refresh(
+            selected
         )
 
-        self.job_list.refresh(selected)
-        self.workspace.update()
+    def select_job(
+        self,
+        job_id,
+    ):
 
-    def select_job(self, job_id):
+        if not job_id:
+            return
+
         self.workspace.set_selected(
-            job_id or None
+            job_id
         )
 
         self.properties.set_job(
             job_id
         )
 
+    def workspace_job_moved(
+        self,
+        job_id,
+    ):
+
+        if (
+            self.properties.job
+            and self.properties.job.id
+            == job_id
+        ):
+
+            self.properties.set_job(
+                job_id
+            )
+
+        self.workspace.update()
+
+    def conversion_finished(
+        self,
+        job_id,
+    ):
+
+        # Automatically select the new G-code job.
+
         self.job_list.refresh(
-            job_id or None
+            job_id
         )
 
-    def conversion_finished(self, output):
-        source = self.properties.job
+        self.select_job(
+            job_id
+        )
 
-        if not source:
+        self.workspace.update()
+
+    def move_machine(
+        self,
+        x,
+        y,
+    ):
+
+        if not self.machine.state.connected:
             return
 
-        output_path = Path(output)
+        try:
 
-        job = self.jobs.create_gcode_job(
-            source,
-            output_path,
-            self.properties.profile.currentData().name,
-            {
-                name: (
-                    widget.isChecked()
-                    if isinstance(
-                        widget,
-                        QCheckBox,
-                    )
-                    else (
-                        widget.currentText()
-                        if isinstance(
-                            widget,
-                            QComboBox,
-                        )
-                        else (
-                            widget.value()
-                            if isinstance(
-                                widget,
-                                (
-                                    QSpinBox,
-                                    QDoubleSpinBox,
-                                ),
-                            )
-                            else widget.text()
-                        )
-                    )
-                )
-                for name, widget
-                in self.properties.parameter_widgets.items()
-            },
-        )
+            self.machine.move_to(
+                x,
+                y,
+                self.machine.state.z,
+            )
 
-        self.select_job(job.id)
-        self.refresh()
+        except Exception as exc:
+
+            QMessageBox.warning(
+                self,
+                "Machine move failed",
+                str(exc),
+            )
 
     def update_machine(self):
-        if self.machine.state.connected:
-            try:
-                self.machine.poll()
-            except Exception as exc:
-                self.machine.disconnect()
-                self.machine_panel.status.setText(
-                    f"Connection lost: {exc}"
-                )
-                self.machine_panel.button.setText(
-                    "Connect"
-                )
-
-        state = self.machine.state
 
         self.machine_panel.update_state()
+
+        if (
+            not self.machine.state.connected
+        ):
+            return
+
+        # Do not block the GUI thread.
+
+        if (
+            self.poll_worker is not None
+            and self.poll_worker.isRunning()
+        ):
+            return
+
+        self.poll_worker = (
+            PollWorker(
+                self.machine
+            )
+        )
+
+        self.poll_worker.updated.connect(
+            self.machine_updated
+        )
+
+        self.poll_worker.failed.connect(
+            self.machine_poll_failed
+        )
+
+        self.poll_worker.start()
+
+    def machine_updated(self):
+
+        state = self.machine.state
 
         self.workspace.set_machine_position(
             state.x,
             state.y,
         )
 
-    def keyPressEvent(self, event):
-        focused = QApplication.focusWidget()
+        self.machine_panel.update_state()
 
-        if isinstance(
-            focused,
-            (
-                QLineEdit,
-                QSpinBox,
-                QDoubleSpinBox,
-            ),
-        ):
-            super().keyPressEvent(event)
-            return
+    def machine_poll_failed(
+        self,
+        message,
+    ):
 
-        step = self.machine_panel.step.value()
+        self.machine.state.message = message
 
-        if event.key() == Qt.Key_Left:
-            self.machine.jog(-step, 0, 0)
-
-        elif event.key() == Qt.Key_Right:
-            self.machine.jog(step, 0, 0)
-
-        elif event.key() == Qt.Key_Up:
-            self.machine.jog(0, step, 0)
-
-        elif event.key() == Qt.Key_Down:
-            self.machine.jog(0, -step, 0)
-
-        else:
-            super().keyPressEvent(event)
-
-
-def run(config):
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication([])
-
-    app.setStyle("Fusion")
-
-    window = MainWindow(config)
-    window.show()
-
-    return app.exec()
+        self.machine_panel.update_state()

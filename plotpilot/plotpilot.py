@@ -87,6 +87,11 @@ class Workspace:
     depth: float = 0.0
     anchors: list[Anchor] = field(default_factory=list)
 
+    # Preview settings shared with Job Properties.
+    preview_limit: int = 20000
+    show_drawing: bool = True
+    show_travel: bool = True
+
 
 @dataclass
 class ConversionProfile:
@@ -233,6 +238,119 @@ def load_config(path: Path) -> MachineConfig:
     host = machine.get("host", "192.168.4.1")
     port = machine.get("port", 80)
 
+    # --------------------------------------------------------
+    # --------------------------------------------------------
+    # Conversion profiles
+    # --------------------------------------------------------
+    #
+    # Profiles are executable shell scripts.
+    #
+    # Their metadata is obtained through:
+    #
+    #     <profile>.sh --json
+    #
+    # --------------------------------------------------------
+
+    profiles = []
+
+    profile_directory = Path(
+        '/home/erik/Projects/plotter/PlotterPilot/plotpilot/config/conversion_profiles'
+    )
+
+    print(
+        "RUNTIME PROFILE DISCOVERY: directory =",
+        profile_directory,
+        flush=True,
+    )
+
+    if not profile_directory.is_dir():
+        print(
+            "RUNTIME PROFILE DISCOVERY: directory missing",
+            flush=True,
+        )
+    else:
+        for command in sorted(
+            profile_directory.glob("*.sh")
+        ):
+            try:
+                result = subprocess.run(
+                    [str(command), "--json"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+
+                metadata = json.loads(
+                    result.stdout
+                )
+
+                if not isinstance(
+                    metadata,
+                    dict,
+                ):
+                    print(
+                        "RUNTIME PROFILE DISCOVERY:"
+                        " invalid metadata",
+                        command,
+                        flush=True,
+                    )
+                    continue
+
+                parameters = metadata.get(
+                    "parameters",
+                    {},
+                )
+
+                if not isinstance(
+                    parameters,
+                    dict,
+                ):
+                    parameters = {}
+
+                name = metadata.get(
+                    "name"
+                )
+
+                if not name:
+                    name = command.stem.replace(
+                        "_",
+                        "-",
+                    )
+
+                profile = ConversionProfile(
+                    name=str(name),
+                    command=str(command),
+                    parameters=parameters,
+                )
+
+                profiles.append(
+                    profile
+                )
+
+                print(
+                    "RUNTIME PROFILE DISCOVERY:"
+                    " loaded",
+                    profile.name,
+                    flush=True,
+                )
+
+            except Exception as exc:
+                print(
+                    "WARNING: failed to load conversion "
+                    "profile",
+                    command,
+                    ":",
+                    exc,
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    print(
+        "RUNTIME PROFILE DISCOVERY: total =",
+        len(profiles),
+        flush=True,
+    )
+
     return MachineConfig(
         host=str(host),
         port=as_int(port, 80),
@@ -251,6 +369,7 @@ def load_config(path: Path) -> MachineConfig:
             ),
             anchors=anchors,
         ),
+        profiles=profiles,
     )
 
 
@@ -2911,12 +3030,21 @@ class JobPropertiesPanel(QFrame):
     converted = Signal(str)
 
     def __init__(
+
         self,
         jobs,
         workspace,
         profiles=None,
     ):
         super().__init__()
+        print(
+            "RUNTIME PROFILE TRACE: PANEL INIT",
+            "class=",
+            type(self).__name__,
+            "profiles=",
+            [getattr(p, "name", repr(p)) for p in getattr(self, "profiles", [])],
+            flush=True,
+        )
 
         self.jobs = jobs
         self.workspace = workspace
@@ -3134,6 +3262,13 @@ class JobPropertiesPanel(QFrame):
             )
         ).lower()
 
+        print(
+            "RUNTIME PROFILE TRACE: SVG condition",
+            repr(source_type),
+            source_type.endswith("svg"),
+            flush=True,
+        )
+
         if source_type.endswith("svg"):
             conversion = QGroupBox(
                 "SVG → G-code"
@@ -3162,6 +3297,18 @@ class JobPropertiesPanel(QFrame):
                     name,
                     profile,
                 )
+
+            print(
+                "RUNTIME PROFILE TRACE: final combo",
+                "count=",
+                self.profile_combo.count(),
+                "items=",
+                [
+                    self.profile_combo.itemText(i)
+                    for i in range(self.profile_combo.count())
+                ],
+                flush=True,
+            )
 
             profile_row.addWidget(
                 self.profile_combo
@@ -3561,7 +3708,11 @@ class JobPropertiesPanel(QFrame):
         )
 
         drawing.setChecked(
-            self.workspace.show_drawing
+            getattr(
+                self.workspace,
+                "show_drawing",
+                True,
+            )
         )
 
         drawing.toggled.connect(
@@ -3912,6 +4063,8 @@ class MainWindow(QMainWindow):
         config,
     ):
 
+        print("RUNTIME PROFILE TRACE: MAINWINDOW INIT", flush=True)
+        print("  config.profiles:", [getattr(p, "name", repr(p)) for p in getattr(config, "profiles", [])], flush=True)
         super().__init__()
 
         self.setWindowTitle(
@@ -3961,6 +4114,13 @@ class MainWindow(QMainWindow):
                 config.workspace,
                 self.jobs,
             )
+        )
+
+        print(
+            "RUNTIME PROFILE TRACE: BEFORE PROPERTY PANEL",
+            "self.profiles=",
+            [getattr(p, "name", repr(p)) for p in self.profiles],
+            flush=True,
         )
 
         self.properties = (
@@ -4284,6 +4444,7 @@ def ensure_default_config():
 
 
 def main():
+    print("RUNTIME MAIN: entered", flush=True)
     project_dir = (
         Path(__file__).resolve().parent
     )
@@ -4305,6 +4466,7 @@ def main():
     config = load_config(
         config_path
     )
+    print("RUNTIME MAIN: config loaded", flush=True)
 
     app = QApplication(
         sys.argv
@@ -4422,8 +4584,10 @@ def main():
     window = MainWindow(
         config
     )
+    print("RUNTIME MAIN: window created", flush=True)
 
     window.show()
+    print("RUNTIME MAIN: window shown", flush=True)
 
     # --------------------------------------------------------
     # Ctrl+C / terminal shutdown.
@@ -4451,6 +4615,7 @@ def main():
 
     signal_timer.start()
 
+    print("RUNTIME MAIN: entering Qt event loop", flush=True)
     return app.exec()
 
 if __name__ == "__main__":
