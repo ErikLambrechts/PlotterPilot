@@ -1902,15 +1902,15 @@ class JobPropertiesPanel(QFrame):
 
     def preview_limit_changed(self, value):
         self.preview.preview_limit = value
-        self.workspace.update()
+        self.preview.update()
 
     def preview_drawing_changed(self, value):
         self.preview.show_drawing = value
-        self.workspace.update()
+        self.preview.update()
 
     def preview_travel_changed(self, value):
         self.preview.show_travel = value
-        self.workspace.update()
+        self.preview.update()
 
     # --------------------------------------------------------
     # Conversion / save

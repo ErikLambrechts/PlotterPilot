@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import socket
 import subprocess
 from datetime import datetime, timedelta
 import sys
@@ -61,6 +62,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QMessageBox,
+    QDialog,
+    QDialogButtonBox,
 )
 
 
@@ -99,6 +102,9 @@ class Workspace:
 class ConversionProfile:
     name: str
     command: str
+    description: str = ""
+    input_type: str | None = None
+    output_type: str | None = None
     parameters: dict = field(default_factory=dict)
 
 
@@ -110,6 +116,20 @@ class MachineConfig:
     profiles: list[ConversionProfile] = field(
         default_factory=list
     )
+
+
+def profile_command(
+    profile: Path | str,
+    *args: str,
+) -> list[str]:
+    profile_path = Path(profile)
+
+    if profile_path.suffix.lower() == ".py":
+        return [sys.executable, str(profile_path), *args]
+    if profile_path.suffix.lower() == ".sh":
+        return ["bash", str(profile_path), *args]
+
+    return [str(profile_path), *args]
 
 
 def load_config(path: Path) -> MachineConfig:
@@ -255,9 +275,19 @@ def load_config(path: Path) -> MachineConfig:
 
     profiles = []
 
-    profile_directory = Path(
-        '/home/erik/Projects/plotter/PlotterPilot/plotpilot/config/conversion_profiles'
+    configured_profiles = machine.get(
+        "conversion_profiles",
+        "config/conversion_profiles",
     )
+    profile_directory = Path(
+        str(configured_profiles)
+    )
+
+    if not profile_directory.is_absolute():
+        profile_directory = (
+            path.parent.parent
+            / profile_directory
+        ).resolve()
 
     print(
         "RUNTIME PROFILE DISCOVERY: directory =",
@@ -272,15 +302,38 @@ def load_config(path: Path) -> MachineConfig:
         )
     else:
         for command in sorted(
-            profile_directory.glob("*.sh")
+            profile_directory.iterdir()
         ):
+            if not command.is_file():
+                continue
+
+            suffix = command.suffix.lower()
+
+            if suffix not in {".sh", ".py"} and not os.access(
+                command,
+                os.X_OK,
+            ):
+                continue
             try:
                 result = subprocess.run(
-                    [str(command), "--json"],
+                    profile_command(
+                        command,
+                        "--json",
+                    ),
                     capture_output=True,
                     text=True,
-                    check=True,
+                    check=False,
                 )
+
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        result.stderr.strip()
+                        or result.stdout.strip()
+                        or (
+                            "profile --json failed "
+                            f"({result.returncode})"
+                        )
+                    )
 
                 metadata = json.loads(
                     result.stdout
@@ -322,6 +375,48 @@ def load_config(path: Path) -> MachineConfig:
                 profile = ConversionProfile(
                     name=str(name),
                     command=str(command),
+                    description=str(
+                        metadata.get(
+                            "description",
+                            "",
+                        )
+                    ),
+                    input_type=(
+                        str(
+                            metadata.get(
+                                "input",
+                                {},
+                            ).get("type")
+                        )
+                        if isinstance(
+                            metadata.get("input"),
+                            dict,
+                        )
+                        and metadata.get(
+                            "input",
+                            {},
+                        ).get("type")
+                        is not None
+                        else None
+                    ),
+                    output_type=(
+                        str(
+                            metadata.get(
+                                "output",
+                                {},
+                            ).get("type")
+                        )
+                        if isinstance(
+                            metadata.get("output"),
+                            dict,
+                        )
+                        and metadata.get(
+                            "output",
+                            {},
+                        ).get("type")
+                        is not None
+                        else None
+                    ),
                     parameters=parameters,
                 )
 
@@ -432,6 +527,9 @@ class Job:
     conversion_profile: str | None = None
     conversion_parameters: dict = field(
         default_factory=dict
+    )
+    pipeline_steps: list[dict] = field(
+        default_factory=list
     )
 
     preview_limit: int = 15000
@@ -1031,6 +1129,8 @@ class FluidNCController:
         self.state = MachineState()
 
         self.session = requests.Session()
+        self.socket = None
+        self.transport = "http"
 
         self._lock = threading.Lock()
 
@@ -1041,22 +1141,75 @@ class FluidNCController:
         )
 
     def connect(self):
-
-        response = self.session.get(
-            self.base_url + "/",
-            timeout=3,
-        )
-
-        response.raise_for_status()
-
         with self._lock:
+            if self.socket is not None:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+            self.state.connected = False
+            self.state.state = "Disconnected"
+
+            http_error = None
+
+            try:
+                response = self.session.get(
+                    self.base_url + "/",
+                    timeout=3,
+                )
+                response.raise_for_status()
+                self.transport = "http"
+            except Exception as exc:
+                http_error = exc
+
+                ports = [self.port]
+
+                if self.port != 23:
+                    ports.append(23)
+
+                socket_error = None
+
+                for port in ports:
+                    try:
+                        sock = socket.create_connection(
+                            (self.host, int(port)),
+                            timeout=5,
+                        )
+                        sock.settimeout(5)
+                        self.socket = sock
+                        self.port = int(port)
+                        self.transport = "socket"
+
+                        try:
+                            sock.recv(4096)
+                        except socket.timeout:
+                            pass
+
+                        break
+                    except Exception as sock_exc:
+                        socket_error = sock_exc
+
+                if self.transport != "socket":
+                    raise RuntimeError(
+                        "HTTP connection failed "
+                        f"({http_error}); socket connection failed "
+                        f"({socket_error})"
+                    ) from socket_error
+
             self.state.connected = True
             self.state.state = "Connected"
             self.state.message = ""
 
     def disconnect(self):
-
         with self._lock:
+            if self.socket is not None:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+
             self.state.connected = False
             self.state.state = "Disconnected"
 
@@ -1064,48 +1217,96 @@ class FluidNCController:
         self,
         command,
     ):
+        with self._lock:
+            if not self.state.connected:
+                raise RuntimeError(
+                    "Machine is not connected"
+                )
 
-        if not self.state.connected:
-            raise RuntimeError(
-                "Machine is not connected"
-            )
+            if self.transport == "socket":
+                if self.socket is None:
+                    raise RuntimeError(
+                        "Socket connection is not available"
+                    )
 
-        response = self.session.get(
-            self.base_url + "/command",
-            params={"cmd": command},
-            timeout=5,
-        )
+                self.socket.sendall(
+                    (command.strip() + "\n").encode()
+                )
 
-        response.raise_for_status()
+                chunks = []
 
-        return response.text
+                while True:
+                    data = self.socket.recv(4096)
 
-    def poll_status(self):
+                    if not data:
+                        raise ConnectionError(
+                            "Connection closed by FluidNC"
+                        )
 
-        if not self.state.connected:
-            return
+                    text = data.decode(
+                        errors="replace"
+                    )
+                    chunks.append(text)
 
-        try:
+                    lower = text.lower()
+
+                    if "ok" in lower:
+                        break
+
+                    if (
+                        "error:" in lower
+                        or "alarm:" in lower
+                    ):
+                        raise RuntimeError(
+                            "".join(chunks).strip()
+                        )
+
+                return "".join(chunks)
 
             response = self.session.get(
                 self.base_url + "/command",
-                params={"cmd": "?"},
-                timeout=2,
+                params={"cmd": command},
+                timeout=5,
             )
 
             response.raise_for_status()
 
-            self.parse_status(
-                response.text
-            )
+            return response.text
 
-        except Exception as exc:
+    def poll_status(self):
+        with self._lock:
+            if not self.state.connected:
+                return
 
-            self.state.message = str(exc)
-            self.state.connected = False
-            self.state.state = (
-                "Connection lost"
-            )
+            try:
+                if self.transport == "socket":
+                    if self.socket is None:
+                        raise RuntimeError(
+                            "Socket connection is not available"
+                        )
+
+                    self.socket.sendall(b"?")
+                    text = self.socket.recv(4096).decode(
+                        errors="replace"
+                    )
+                else:
+                    response = self.session.get(
+                        self.base_url + "/command",
+                        params={"cmd": "?"},
+                        timeout=2,
+                    )
+
+                    response.raise_for_status()
+                    text = response.text
+
+                self.parse_status(text)
+
+            except Exception as exc:
+                self.state.message = str(exc)
+                self.state.connected = False
+                self.state.state = (
+                    "Connection lost"
+                )
 
     def parse_status(self, text):
 
@@ -2722,6 +2923,12 @@ class MachinePanel(QFrame):
             f"Connection failed: {message}"
         )
 
+        QMessageBox.warning(
+            self,
+            "Connection failed",
+            str(message),
+        )
+
         self.stateChanged.emit()
 
     def connection_finished(self):
@@ -2987,12 +3194,15 @@ class JobListPanel(QFrame):
             ),
         )
 
+        selected_id = None
+
         for filename in files:
 
             try:
-                self.jobs.add_file(
+                job = self.jobs.add_file(
                     Path(filename)
                 )
+                selected_id = job.id
 
             except Exception as exc:
 
@@ -3003,6 +3213,10 @@ class JobListPanel(QFrame):
                 )
 
         self.changed.emit()
+
+        if selected_id:
+            self.refresh(selected_id)
+            self.selected.emit(selected_id)
 
     def remove(self):
 
@@ -3027,6 +3241,289 @@ class JobListPanel(QFrame):
 # ============================================================
 
 
+class PipelineDialog(QDialog):
+
+    def __init__(
+        self,
+        parent,
+        profiles,
+        source_type,
+        initial_steps=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Add pipeline")
+        self.resize(700, 500)
+
+        self.profiles = profiles
+        self.source_type = source_type
+        self.steps = list(initial_steps or [])
+
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        self.profile_combo = QComboBox()
+
+        for profile in self.profiles:
+            self.profile_combo.addItem(
+                profile.name,
+                profile.name,
+            )
+
+        add_step = QPushButton("Add step")
+        add_step.clicked.connect(self.add_step)
+        remove_step = QPushButton("Remove step")
+        remove_step.clicked.connect(
+            self.remove_step
+        )
+
+        top.addWidget(QLabel("Profile"))
+        top.addWidget(self.profile_combo)
+        top.addWidget(add_step)
+        top.addWidget(remove_step)
+        layout.addLayout(top)
+
+        body = QHBoxLayout()
+        self.step_list = QListWidget()
+        self.step_list.currentRowChanged.connect(
+            self.select_step
+        )
+        body.addWidget(self.step_list, 2)
+
+        self.parameters_group = QGroupBox(
+            "Step parameters"
+        )
+        self.parameters_layout = QVBoxLayout(
+            self.parameters_group
+        )
+        body.addWidget(self.parameters_group, 3)
+        layout.addLayout(body)
+
+        self.preview = QLabel("")
+        self.preview.setWordWrap(True)
+        layout.addWidget(self.preview)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok
+            | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.refresh_steps()
+
+    def add_step(self):
+        profile_name = self.profile_combo.currentData()
+        profile = self._profile(profile_name)
+
+        if profile is None:
+            return
+
+        params = {}
+
+        for name, spec in profile.parameters.items():
+            if isinstance(spec, dict):
+                params[name] = spec.get("default")
+            else:
+                params[name] = spec
+
+        self.steps.append(
+            {
+                "profile": profile.name,
+                "parameters": params,
+            }
+        )
+
+        self.refresh_steps()
+        self.step_list.setCurrentRow(
+            self.step_list.count() - 1
+        )
+
+    def remove_step(self):
+        row = self.step_list.currentRow()
+
+        if row < 0:
+            return
+
+        self.steps.pop(row)
+        self.refresh_steps()
+
+    def select_step(self, row):
+        while self.parameters_layout.count():
+            item = self.parameters_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        if row < 0 or row >= len(self.steps):
+            self.parameters_layout.addStretch()
+            return
+
+        step = self.steps[row]
+        profile = self._profile(step.get("profile"))
+
+        if profile is None:
+            self.parameters_layout.addStretch()
+            return
+
+        for name, spec in profile.parameters.items():
+            value = step.get("parameters", {}).get(
+                name
+            )
+
+            if isinstance(spec, dict):
+                if value is None:
+                    value = spec.get("default")
+                p_type = str(
+                    spec.get("type", "string")
+                ).lower()
+                options = spec.get("options", [])
+            else:
+                p_type = "string"
+                options = []
+
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(
+                0,
+                0,
+                0,
+                0,
+            )
+            row_layout.addWidget(QLabel(str(name)))
+
+            if p_type == "boolean":
+                editor = QCheckBox()
+                editor.setChecked(bool(value))
+                editor.toggled.connect(
+                    lambda checked, n=name, r=row:
+                    self._set_param(r, n, checked)
+                )
+            elif options:
+                editor = QComboBox()
+                editor.addItems(
+                    [str(o) for o in options]
+                )
+                if value is not None:
+                    idx = editor.findText(str(value))
+                    if idx >= 0:
+                        editor.setCurrentIndex(idx)
+                editor.currentTextChanged.connect(
+                    lambda text, n=name, r=row:
+                    self._set_param(r, n, text)
+                )
+            elif p_type == "number":
+                editor = QDoubleSpinBox()
+                editor.setRange(-1_000_000, 1_000_000)
+                editor.setDecimals(4)
+                try:
+                    editor.setValue(float(value))
+                except Exception:
+                    editor.setValue(0.0)
+                editor.valueChanged.connect(
+                    lambda v, n=name, r=row:
+                    self._set_param(r, n, v)
+                )
+            elif p_type == "integer":
+                editor = QSpinBox()
+                editor.setRange(-1_000_000, 1_000_000)
+                try:
+                    editor.setValue(int(value))
+                except Exception:
+                    editor.setValue(0)
+                editor.valueChanged.connect(
+                    lambda v, n=name, r=row:
+                    self._set_param(r, n, v)
+                )
+            else:
+                editor = QLineEdit(
+                    "" if value is None else str(value)
+                )
+                editor.textChanged.connect(
+                    lambda text, n=name, r=row:
+                    self._set_param(r, n, text)
+                )
+
+            row_layout.addWidget(editor)
+            self.parameters_layout.addWidget(row_widget)
+
+        self.parameters_layout.addStretch()
+
+    def _set_param(
+        self,
+        row,
+        name,
+        value,
+    ):
+        if row < 0 or row >= len(self.steps):
+            return
+
+        self.steps[row].setdefault(
+            "parameters",
+            {},
+        )[name] = value
+
+    def _profile(self, name):
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        return None
+
+    def refresh_steps(self):
+        self.step_list.clear()
+
+        for index, step in enumerate(self.steps, start=1):
+            profile = self._profile(
+                step.get("profile")
+            )
+            if profile is None:
+                text = f"{index}. {step.get('profile', '?')}"
+            else:
+                text = (
+                    f"{index}. {profile.name} "
+                    f"({profile.input_type or '?'} → {profile.output_type or '?'})"
+                )
+            self.step_list.addItem(text)
+
+        self.preview.setText(self._pipeline_preview())
+        self.select_step(self.step_list.currentRow())
+
+    def _pipeline_preview(self):
+        stage = self.source_type
+        parts = [stage]
+        warnings = []
+
+        for step in self.steps:
+            profile = self._profile(
+                step.get("profile")
+            )
+
+            if profile is None:
+                warnings.append(
+                    f"Unknown profile: {step.get('profile')}"
+                )
+                continue
+
+            expected = profile.input_type
+            if expected and expected != "none" and expected != stage:
+                warnings.append(
+                    f"{profile.name} expects {expected} but current stage is {stage}"
+                )
+
+            stage = profile.output_type or stage
+            parts.append(stage)
+
+        summary = " → ".join(parts)
+
+        if warnings:
+            summary += "\n⚠ " + "\n⚠ ".join(warnings)
+
+        return summary
+
+    def result_steps(self):
+        return [dict(step) for step in self.steps]
+
+
 class JobPropertiesPanel(QFrame):
     changed = Signal()
     converted = Signal(str)
@@ -3037,6 +3534,7 @@ class JobPropertiesPanel(QFrame):
         jobs,
         workspace,
         profiles=None,
+        preview=None,
     ):
         super().__init__()
         print(
@@ -3051,6 +3549,7 @@ class JobPropertiesPanel(QFrame):
         self.jobs = jobs
         self.workspace = workspace
         self.profiles = profiles or []
+        self.preview = preview
         self.job = None
 
         layout = QVBoxLayout(self)
@@ -3438,6 +3937,24 @@ class JobPropertiesPanel(QFrame):
 
             conversion_layout.addWidget(
                 convert
+            )
+
+            pipeline = QPushButton(
+                "Add pipeline"
+            )
+            pipeline.clicked.connect(
+                self.configure_pipeline
+            )
+            conversion_layout.addWidget(
+                pipeline
+            )
+
+            self.pipeline_summary = QLabel(
+                self.pipeline_text(job)
+            )
+            self.pipeline_summary.setWordWrap(True)
+            conversion_layout.addWidget(
+                self.pipeline_summary
             )
 
             self.content_layout.addWidget(
@@ -3933,15 +4450,85 @@ class JobPropertiesPanel(QFrame):
 
     def preview_limit_changed(self, value):
         self.workspace.preview_limit = value
-        self.workspace.update()
+        if self.preview is not None:
+            self.preview.preview_limit = value
+            self.preview.update()
 
     def preview_drawing_changed(self, value):
         self.workspace.show_drawing = value
-        self.workspace.update()
+        if self.preview is not None:
+            self.preview.show_drawing = value
+            self.preview.update()
 
     def preview_travel_changed(self, value):
         self.workspace.show_travel = value
-        self.workspace.update()
+        if self.preview is not None:
+            self.preview.show_travel = value
+            self.preview.update()
+
+    def _profile_by_name(self, name):
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        return None
+
+    def pipeline_text(self, job):
+        steps = getattr(job, "pipeline_steps", [])
+
+        if not steps:
+            return "Pipeline: none"
+
+        source_type = str(
+            getattr(
+                getattr(job, "source_type", None),
+                "value",
+                getattr(job, "source_type", ""),
+            )
+        ).lower()
+
+        parts = [source_type]
+
+        for step in steps:
+            profile = self._profile_by_name(
+                step.get("profile")
+            )
+            if profile is None:
+                parts.append("?")
+                continue
+            parts.append(profile.output_type or "?")
+
+        return "Pipeline: " + " → ".join(parts)
+
+    def configure_pipeline(self):
+        if not self.job:
+            return
+
+        source_type = str(
+            getattr(
+                getattr(self.job, "source_type", None),
+                "value",
+                getattr(self.job, "source_type", ""),
+            )
+        ).lower()
+
+        dialog = PipelineDialog(
+            self,
+            self.profiles,
+            source_type,
+            getattr(self.job, "pipeline_steps", []),
+        )
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.job.pipeline_steps = dialog.result_steps()
+
+        if hasattr(self, "pipeline_summary"):
+            self.pipeline_summary.setText(
+                self.pipeline_text(self.job)
+            )
+
+        self.changed.emit()
 
     # --------------------------------------------------------
     # Conversion / save
@@ -3961,6 +4548,12 @@ class JobPropertiesPanel(QFrame):
             elif isinstance(widget, QDoubleSpinBox):
                 result[name] = widget.value()
 
+            elif isinstance(widget, QSpinBox):
+                result[name] = widget.value()
+
+            elif isinstance(widget, QComboBox):
+                result[name] = widget.currentText()
+
             elif isinstance(widget, QLineEdit):
                 result[name] = widget.text()
 
@@ -3979,70 +4572,171 @@ class JobPropertiesPanel(QFrame):
             return
 
         parameters = self._parameters()
+        steps = list(
+            getattr(self.job, "pipeline_steps", [])
+        )
 
-        try:
-            command = [
-                str(profile.command),
-                "--input",
-                str(self.job.source),
-                "--output",
-                "-",
+        if not steps:
+            steps = [
+                {
+                    "profile": profile.name,
+                    "parameters": parameters,
+                }
             ]
 
-            for name, value in parameters.items():
-                if value is None:
-                    continue
+        current_type = str(
+            getattr(
+                getattr(self.job, "source_type", None),
+                "value",
+                getattr(self.job, "source_type", ""),
+            )
+        ).lower()
+        current_path = Path(self.job.source)
+        gcode = ""
+        temp_paths = []
 
-                option = f"--{name}"
+        try:
+            for index, step in enumerate(steps):
+                step_profile = self._profile_by_name(
+                    step.get("profile")
+                )
 
-                if isinstance(value, bool):
-                    if value:
-                        command.append(option)
-                else:
+                if step_profile is None:
+                    raise RuntimeError(
+                        f"Unknown profile in pipeline: {step.get('profile')}"
+                    )
+
+                expected = str(
+                    step_profile.input_type or ""
+                ).lower()
+
+                if expected and expected != "none" and expected != current_type:
+                    raise RuntimeError(
+                        f"Profile '{step_profile.name}' expects '{expected}', got '{current_type}'"
+                    )
+
+                command = profile_command(
+                    step_profile.command
+                )
+
+                if expected != "none":
                     command.extend(
                         [
-                            option,
-                            str(value),
+                            "--input",
+                            str(current_path),
                         ]
                     )
 
-            print(
-                "RUNTIME PROFILE CONVERSION:",
-                command,
-                flush=True,
-            )
-
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-            )
-
-            if result.returncode != 0:
-                error = (
-                    result.stderr.strip()
-                    or result.stdout.strip()
-                    or (
-                        "Conversion profile exited "
-                        f"with code {result.returncode}"
-                    )
+                command.extend(
+                    [
+                        "--output",
+                        "-",
+                    ]
                 )
 
-                raise RuntimeError(error)
+                for name, value in step.get(
+                    "parameters",
+                    {},
+                ).items():
+                    if value is None:
+                        continue
 
-            gcode = result.stdout
+                    option = f"--{name}"
 
-            if not gcode.strip():
+                    if isinstance(value, bool):
+                        if value:
+                            command.append(option)
+                    else:
+                        command.extend(
+                            [
+                                option,
+                                str(value),
+                            ]
+                        )
+
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                )
+
+                if result.returncode != 0:
+                    error = (
+                        result.stderr.strip()
+                        or result.stdout.strip()
+                        or (
+                            "Conversion profile exited "
+                            f"with code {result.returncode}"
+                        )
+                    )
+                    raise RuntimeError(error)
+
+                output = result.stdout
+
+                if not output.strip():
+                    raise RuntimeError(
+                        f"Profile '{step_profile.name}' produced no output"
+                    )
+
+                output_type = str(
+                    step_profile.output_type or ""
+                ).lower()
+
+                if not output_type:
+                    output_type = (
+                        "gcode"
+                        if index == len(steps) - 1
+                        else current_type
+                    )
+
+                if output_type == "svg":
+                    temp = tempfile.NamedTemporaryFile(
+                        suffix=".svg",
+                        delete=False,
+                    )
+                    temp.write(
+                        output.encode("utf-8")
+                    )
+                    temp.close()
+                    temp_paths.append(temp.name)
+                    current_path = Path(temp.name)
+                    current_type = "svg"
+                    continue
+
+                if output_type == "gcode":
+                    gcode = output
+                    current_type = "gcode"
+
+                    if index < len(steps) - 1:
+                        temp = tempfile.NamedTemporaryFile(
+                            suffix=".gcode",
+                            delete=False,
+                        )
+                        temp.write(
+                            output.encode("utf-8")
+                        )
+                        temp.close()
+                        temp_paths.append(temp.name)
+                        current_path = Path(temp.name)
+                    continue
+
                 raise RuntimeError(
-                    "Conversion profile produced no G-code "
-                    "on stdout"
+                    f"Unsupported profile output type: {output_type}"
+                )
+
+            if current_type != "gcode" or not gcode.strip():
+                raise RuntimeError(
+                    "Pipeline must end with G-code output"
                 )
 
             new_job = self.jobs.create_generated_gcode(
                 self.job,
                 gcode,
-                profile.name,
-                parameters,
+                steps[-1].get("profile", profile.name),
+                steps[-1].get(
+                    "parameters",
+                    {},
+                ),
             )
 
             self.converted.emit(
@@ -4055,6 +4749,12 @@ class JobPropertiesPanel(QFrame):
                 "Conversion failed",
                 str(exc),
             )
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    Path(temp_path).unlink()
+                except OSError:
+                    pass
 
     def save_gcode(self):
         if not self.job:
@@ -4179,6 +4879,7 @@ class MainWindow(QMainWindow):
                 self.jobs,
                 config.workspace,
                 self.profiles,
+                self.workspace,
             )
         )
 
@@ -4757,4 +5458,3 @@ if __name__ == "__main__":
             pass
 
         event.accept()
-
