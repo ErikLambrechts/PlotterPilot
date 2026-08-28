@@ -518,6 +518,7 @@ def load_config(path: Path) -> MachineConfig:
 class JobSourceType(str, Enum):
     SVG = "svg"
     GCODE = "gcode"
+    DUMMY = "dummy"
 
 
 @dataclass
@@ -618,6 +619,16 @@ class JobManager:
 
         self.jobs.append(job)
 
+        return job
+
+    def add_dummy(self, name="Dummy job") -> Job:
+        job = Job(
+            name=name,
+            source=Path("dummy.job"),
+            source_type=JobSourceType.DUMMY,
+            active=False,
+        )
+        self.jobs.append(job)
         return job
 
     def create_generated_gcode(
@@ -3261,6 +3272,14 @@ class JobListPanel(QFrame):
 
         layout.addWidget(add)
 
+        add_dummy = QPushButton(
+            "Add Dummy Job"
+        )
+        add_dummy.clicked.connect(
+            self.add_dummy
+        )
+        layout.addWidget(add_dummy)
+
         self.list = QListWidget()
 
         self.list.currentItemChanged.connect(
@@ -3436,6 +3455,12 @@ class JobListPanel(QFrame):
         )
 
         self.changed.emit()
+
+    def add_dummy(self):
+        job = self.jobs.add_dummy()
+        self.changed.emit()
+        self.refresh(job.id)
+        self.selected.emit(job.id)
 
 
 # ============================================================
@@ -3981,9 +4006,12 @@ class JobPropertiesPanel(QFrame):
             flush=True,
         )
 
-        if source_type.endswith("svg"):
+        is_svg = source_type.endswith("svg")
+        is_dummy = source_type.endswith("dummy")
+
+        if is_svg or is_dummy:
             conversion = QGroupBox(
-                "SVG → G-code"
+                "Pipeline"
             )
 
             conversion_layout = QVBoxLayout(
@@ -3998,12 +4026,31 @@ class JobPropertiesPanel(QFrame):
 
             self.profile_combo = QComboBox()
 
+            if is_svg:
+                input_type = "svg"
+            else:
+                input_type = "none"
+
             for profile in self.profiles:
                 name = getattr(
                     profile,
                     "name",
                     str(profile),
                 )
+                profile_input = str(
+                    getattr(
+                        profile,
+                        "input_type",
+                        "",
+                    )
+                    or ""
+                ).lower()
+                if (
+                    profile_input
+                    and profile_input
+                    not in {input_type, "none"}
+                ):
+                    continue
 
                 self.profile_combo.addItem(
                     name,
@@ -4026,9 +4073,10 @@ class JobPropertiesPanel(QFrame):
                 self.profile_combo
             )
 
-            conversion_layout.addLayout(
-                profile_row
-            )
+            if is_svg:
+                conversion_layout.addLayout(
+                    profile_row
+                )
 
             params = QWidget()
             params_layout = QVBoxLayout(params)
@@ -4161,33 +4209,47 @@ class JobPropertiesPanel(QFrame):
 
                 params_layout.addStretch()
 
-            rebuild_parameters()
+            if is_svg:
+                rebuild_parameters()
 
-            self.profile_combo.currentIndexChanged.connect(
-                rebuild_parameters
-            )
+                self.profile_combo.currentIndexChanged.connect(
+                    rebuild_parameters
+                )
 
-            collapsible = CollapsibleSection(
-                "Conversion parameters",
-                params,
-                expanded=False,
-            )
+                collapsible = CollapsibleSection(
+                    "Conversion parameters",
+                    params,
+                    expanded=False,
+                )
 
-            conversion_layout.addWidget(
-                collapsible
-            )
+                conversion_layout.addWidget(
+                    collapsible
+                )
 
-            convert = QPushButton(
-                "Convert to G-code"
-            )
+                convert = QPushButton(
+                    "Convert to G-code"
+                )
 
-            convert.clicked.connect(
-                self.convert_to_gcode
-            )
+                convert.clicked.connect(
+                    self.convert_to_gcode
+                )
 
-            conversion_layout.addWidget(
-                convert
-            )
+                conversion_layout.addWidget(
+                    convert
+                )
+            else:
+                info = QLabel(
+                    "Dummy jobs start without input.\n"
+                    "Use a pipeline that can generate output."
+                )
+                conversion_layout.addWidget(info)
+                convert = QPushButton(
+                    "Run pipeline to G-code"
+                )
+                convert.clicked.connect(
+                    self.convert_to_gcode
+                )
+                conversion_layout.addWidget(convert)
 
             pipeline = QPushButton(
                 "Edit pipeline"
@@ -4926,7 +4988,17 @@ class JobPropertiesPanel(QFrame):
                 getattr(self.job, "source_type", ""),
             )
         ).lower()
-        current_path = Path(self.job.source)
+        current_path = (
+            Path(self.job.source)
+            if str(
+                getattr(
+                    getattr(self.job, "source_type", None),
+                    "value",
+                    getattr(self.job, "source_type", ""),
+                )
+            ).lower() != "dummy"
+            else None
+        )
         gcode = ""
         temp_paths = []
 
@@ -4955,6 +5027,10 @@ class JobPropertiesPanel(QFrame):
                 )
 
                 if expected != "none":
+                    if current_path is None:
+                        raise RuntimeError(
+                            f"Profile '{step_profile.name}' requires input but no stage input is available"
+                        )
                     command.extend(
                         [
                             "--input",
