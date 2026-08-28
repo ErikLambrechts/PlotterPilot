@@ -66,6 +66,10 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
 )
+try:
+    from .state_store import StateStore
+except ImportError:
+    from state_store import StateStore
 
 
 # ============================================================
@@ -121,6 +125,7 @@ class MachineConfig:
 
 
 logger = logging.getLogger(__name__)
+state_store = StateStore()
 
 
 def show_warning(parent, title, message):
@@ -2664,6 +2669,18 @@ class MachinePanel(QFrame):
 
         self.machine = machine
         self.worker = None
+        saved_host = state_store.get(
+            "machine.host",
+            machine.host,
+        )
+        saved_port = state_store.get(
+            "machine.port",
+            machine.port,
+        )
+        saved_step = state_store.get(
+            "machine.jog_step",
+            10.0,
+        )
 
         layout = QVBoxLayout(self)
 
@@ -2678,7 +2695,10 @@ class MachinePanel(QFrame):
         row.addWidget(QLabel("Host"))
 
         self.host = QLineEdit(
-            machine.host
+            str(saved_host)
+        )
+        self.host.editingFinished.connect(
+            self.persist_settings
         )
 
         row.addWidget(self.host)
@@ -2689,7 +2709,13 @@ class MachinePanel(QFrame):
 
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
-        self.port.setValue(machine.port)
+        try:
+            self.port.setValue(int(saved_port))
+        except (TypeError, ValueError):
+            self.port.setValue(machine.port)
+        self.port.valueChanged.connect(
+            self.persist_settings
+        )
 
         row.addWidget(self.port)
         connection_layout.addLayout(row)
@@ -2752,8 +2778,14 @@ class MachinePanel(QFrame):
             0.01,
             10000,
         )
-        self.step.setValue(10)
+        try:
+            self.step.setValue(float(saved_step))
+        except (TypeError, ValueError):
+            self.step.setValue(10)
         self.step.setDecimals(2)
+        self.step.valueChanged.connect(
+            self.persist_settings
+        )
 
         row.addWidget(self.step)
 
@@ -2926,6 +2958,7 @@ class MachinePanel(QFrame):
 
         self.machine.host = host
         self.machine.port = self.port.value()
+        self.persist_settings()
 
         self.connect_button.setEnabled(False)
         self.status.setText(
@@ -3040,6 +3073,20 @@ class MachinePanel(QFrame):
                 "Command failed",
                 str(exc),
             )
+
+    def persist_settings(self, *_args):
+        state_store.set(
+            "machine.host",
+            self.host.text().strip(),
+        )
+        state_store.set(
+            "machine.port",
+            self.port.value(),
+        )
+        state_store.set(
+            "machine.jog_step",
+            self.step.value(),
+        )
 
     def update_state(self):
         """Refresh the machine status without performing I/O."""
@@ -4577,18 +4624,30 @@ class JobPropertiesPanel(QFrame):
 
     def preview_limit_changed(self, value):
         self.workspace.preview_limit = value
+        state_store.set(
+            "preview.limit",
+            int(value),
+        )
         if self.preview is not None:
             self.preview.preview_limit = value
             self.preview.update()
 
     def preview_drawing_changed(self, value):
         self.workspace.show_drawing = value
+        state_store.set(
+            "preview.show_drawing",
+            bool(value),
+        )
         if self.preview is not None:
             self.preview.show_drawing = value
             self.preview.update()
 
     def preview_travel_changed(self, value):
         self.workspace.show_travel = value
+        state_store.set(
+            "preview.show_travel",
+            bool(value),
+        )
         if self.preview is not None:
             self.preview.show_travel = value
             self.preview.update()
@@ -5048,6 +5107,24 @@ class MainWindow(QMainWindow):
             WorkspaceView(
                 config.workspace,
                 self.jobs,
+            )
+        )
+        self.workspace.preview_limit = int(
+            state_store.get(
+                "preview.limit",
+                self.workspace.preview_limit,
+            )
+        )
+        self.workspace.show_drawing = bool(
+            state_store.get(
+                "preview.show_drawing",
+                self.workspace.show_drawing,
+            )
+        )
+        self.workspace.show_travel = bool(
+            state_store.get(
+                "preview.show_travel",
+                self.workspace.show_travel,
             )
         )
 
