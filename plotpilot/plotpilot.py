@@ -26,6 +26,7 @@ from pathlib import Path
 import requests
 
 from PySide6.QtCore import (
+    QByteArray,
     QPointF,
     QRectF,
     QThread,
@@ -33,6 +34,10 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
+try:
+    from PySide6.QtSvgWidgets import QSvgWidget
+except Exception:
+    QSvgWidget = None
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -1572,6 +1577,76 @@ class PollWorker(QThread):
             )
 
 
+class ExecutionWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(str)
+
+    def __init__(self, machine, jobs):
+        super().__init__()
+        self.machine = machine
+        self.jobs = jobs
+        self._paused = False
+        self._stopped = False
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        lines = []
+
+        for job in self.jobs:
+            gcode = getattr(job, "gcode", None)
+            if not gcode:
+                try:
+                    gcode = Path(job.source).read_text(
+                        encoding="utf-8"
+                    )
+                except Exception:
+                    continue
+
+            for raw in gcode.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(";"):
+                    continue
+                lines.append(line)
+
+        total = len(lines)
+        if total == 0:
+            self.finished.emit("No active G-code jobs to run")
+            return
+
+        for index, line in enumerate(lines, start=1):
+            if self._stopped:
+                self.finished.emit("Stopped")
+                return
+
+            while self._paused and not self._stopped:
+                self.msleep(100)
+
+            try:
+                self.machine.send_command(line)
+            except Exception as exc:
+                self.finished.emit(
+                    f"Execution failed: {exc}"
+                )
+                return
+
+            if index % 20 == 0 or index == total:
+                self.progress.emit(
+                    f"Running {index}/{total}"
+                )
+
+        self.finished.emit("Completed")
+
+
 # ============================================================
 # Workspace view
 # ============================================================
@@ -2714,6 +2789,11 @@ class CollapsibleSection(QFrame):
 
 class MachinePanel(QFrame):
     stateChanged = Signal()
+    startRequested = Signal()
+    pauseRequested = Signal()
+    resumeRequested = Signal()
+    stopRequested = Signal()
+    feedOverrideChanged = Signal(int)
 
     def __init__(self, machine):
         super().__init__()
@@ -2828,6 +2908,55 @@ class MachinePanel(QFrame):
         command_row.addWidget(self.gcode_input)
         command_row.addWidget(send_gcode)
         layout.addLayout(command_row)
+
+        execution = QGroupBox("Execution")
+        execution_layout = QVBoxLayout(execution)
+        action_row = QHBoxLayout()
+        start_button = QPushButton("Start")
+        start_button.clicked.connect(
+            self.startRequested.emit
+        )
+        pause_button = QPushButton("Pause")
+        pause_button.clicked.connect(
+            self.pauseRequested.emit
+        )
+        resume_button = QPushButton("Resume")
+        resume_button.clicked.connect(
+            self.resumeRequested.emit
+        )
+        stop_button = QPushButton("Stop")
+        stop_button.clicked.connect(
+            self.stopRequested.emit
+        )
+        action_row.addWidget(start_button)
+        action_row.addWidget(pause_button)
+        action_row.addWidget(resume_button)
+        action_row.addWidget(stop_button)
+        execution_layout.addLayout(action_row)
+
+        feed_row = QHBoxLayout()
+        feed_row.addWidget(
+            QLabel("Feed override")
+        )
+        self.feed_override = QSlider(
+            Qt.Horizontal
+        )
+        self.feed_override.setRange(10, 300)
+        self.feed_override.setValue(100)
+        self.feed_override.valueChanged.connect(
+            self.feedOverrideChanged.emit
+        )
+        self.feed_override_label = QLabel("100%")
+        self.feed_override.valueChanged.connect(
+            lambda value:
+            self.feed_override_label.setText(
+                f"{value}%"
+            )
+        )
+        feed_row.addWidget(self.feed_override)
+        feed_row.addWidget(self.feed_override_label)
+        execution_layout.addLayout(feed_row)
+        layout.addWidget(execution)
 
         layout.addWidget(
             QLabel("<b>Jog</b>")
@@ -3547,6 +3676,7 @@ class PipelineDialog(QDialog):
         parent,
         profiles,
         source_type,
+        source_path=None,
         initial_steps=None,
     ):
         super().__init__(parent)
@@ -3555,7 +3685,9 @@ class PipelineDialog(QDialog):
 
         self.profiles = profiles
         self.source_type = source_type
+        self.source_path = source_path
         self.steps = list(initial_steps or [])
+        self.stage_outputs = []
 
         layout = QVBoxLayout(self)
 
@@ -3601,6 +3733,26 @@ class PipelineDialog(QDialog):
         self.preview = QLabel("")
         self.preview.setWordWrap(True)
         layout.addWidget(self.preview)
+
+        stage_row = QHBoxLayout()
+        stage_row.addWidget(QLabel("Preview stage"))
+        self.stage_combo = QComboBox()
+        self.stage_combo.currentIndexChanged.connect(
+            self.render_stage
+        )
+        stage_row.addWidget(self.stage_combo)
+        layout.addLayout(stage_row)
+
+        if QSvgWidget is not None:
+            self.svg_preview = QSvgWidget()
+            self.svg_preview.setMinimumHeight(240)
+            layout.addWidget(self.svg_preview)
+        else:
+            self.svg_preview = None
+        self.preview_text = QLabel("")
+        self.preview_text.setWordWrap(True)
+        self.preview_text.setMinimumHeight(120)
+        layout.addWidget(self.preview_text)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok
@@ -3802,6 +3954,7 @@ class PipelineDialog(QDialog):
             "parameters",
             {},
         )[name] = value
+        self.refresh_steps()
 
     def _profile(self, name):
         for profile in self.profiles:
@@ -3826,6 +3979,8 @@ class PipelineDialog(QDialog):
             self.step_list.addItem(text)
 
         self.preview.setText(self._pipeline_preview())
+        self._recompute_stage_outputs()
+        self._refresh_stage_selector()
         self.select_step(self.step_list.currentRow())
 
     def _update_step_actions(self, row):
@@ -3875,6 +4030,202 @@ class PipelineDialog(QDialog):
 
     def result_steps(self):
         return [dict(step) for step in self.steps]
+
+    def _recompute_stage_outputs(self):
+        self.stage_outputs = []
+        stage_type = self.source_type
+        stage_output = ""
+
+        if (
+            stage_type == "svg"
+            and self.source_path is not None
+        ):
+            try:
+                stage_output = Path(
+                    self.source_path
+                ).read_text(encoding="utf-8")
+            except Exception:
+                stage_output = ""
+
+        self.stage_outputs.append(
+            {
+                "name": "Input",
+                "type": stage_type,
+                "output": stage_output,
+            }
+        )
+
+        current_type = stage_type
+        current_output = stage_output
+
+        for index, step in enumerate(self.steps, start=1):
+            profile = self._profile(
+                step.get("profile")
+            )
+            if profile is None:
+                self.stage_outputs.append(
+                    {
+                        "name": f"Step {index}",
+                        "type": current_type,
+                        "output": "",
+                    }
+                )
+                continue
+
+            expected = str(
+                profile.input_type or ""
+            ).lower()
+            command = profile_command(
+                profile.command
+            )
+
+            stdin_data = None
+            if expected and expected != "none":
+                command.extend(
+                    [
+                        "--input",
+                        "-",
+                    ]
+                )
+                stdin_data = current_output
+
+            command.extend(
+                [
+                    "--output",
+                    "-",
+                ]
+            )
+
+            parameters = step.get(
+                "parameters",
+                {},
+            )
+            profile_parameters = getattr(
+                profile,
+                "parameters",
+                {},
+            )
+            for name, value in parameters.items():
+                specification = profile_parameters.get(
+                    name,
+                    {},
+                )
+                parameter_type = (
+                    str(
+                        specification.get(
+                            "type",
+                            "",
+                        )
+                    ).lower()
+                    if isinstance(
+                        specification,
+                        dict,
+                    )
+                    else ""
+                )
+                if parameter_type == "boolean":
+                    if str(value).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }:
+                        command.append(f"--{name}")
+                    continue
+
+                command.extend(
+                    [f"--{name}", str(value)]
+                )
+
+            try:
+                result = subprocess.run(
+                    command,
+                    input=stdin_data,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    current_output = (
+                        result.stderr.strip()
+                        or result.stdout.strip()
+                    )
+                    current_type = "error"
+                else:
+                    current_output = result.stdout
+                    current_type = str(
+                        profile.output_type
+                        or current_type
+                    ).lower()
+            except Exception as exc:
+                current_output = str(exc)
+                current_type = "error"
+
+            self.stage_outputs.append(
+                {
+                    "name": f"Step {index}",
+                    "type": current_type,
+                    "output": current_output,
+                }
+            )
+
+    def _refresh_stage_selector(self):
+        self.stage_combo.blockSignals(True)
+        current = self.stage_combo.currentIndex()
+        self.stage_combo.clear()
+        for stage in self.stage_outputs:
+            self.stage_combo.addItem(
+                f"{stage['name']} ({stage['type']})"
+            )
+        if self.stage_combo.count():
+            self.stage_combo.setCurrentIndex(
+                min(
+                    max(current, 0),
+                    self.stage_combo.count() - 1,
+                )
+            )
+        self.stage_combo.blockSignals(False)
+        self.render_stage(
+            self.stage_combo.currentIndex()
+        )
+
+    def render_stage(self, index):
+        if index < 0 or index >= len(self.stage_outputs):
+            return
+
+        stage = self.stage_outputs[index]
+        stage_type = stage.get("type", "")
+        output = stage.get("output", "")
+
+        if (
+            stage_type == "svg"
+            and self.svg_preview is not None
+            and output
+        ):
+            self.svg_preview.load(
+                QByteArray(output.encode("utf-8"))
+            )
+            self.svg_preview.setVisible(True)
+        elif self.svg_preview is not None:
+            self.svg_preview.setVisible(False)
+
+        if stage_type == "svg":
+            self.preview_text.setText(
+                "SVG preview shown above."
+            )
+        elif stage_type == "gcode":
+            self.preview_text.setText(
+                "\n".join(
+                    output.splitlines()[:12]
+                )
+            )
+        elif stage_type == "error":
+            self.preview_text.setText(
+                f"Stage error:\n{output}"
+            )
+        else:
+            self.preview_text.setText(
+                output[:800]
+            )
 
 
 class JobPropertiesPanel(QFrame):
@@ -5095,6 +5446,9 @@ class JobPropertiesPanel(QFrame):
             self,
             self.profiles,
             source_type,
+            self.job.source
+            if source_type != "dummy"
+            else None,
             getattr(self.job, "pipeline_steps", []),
         )
 
@@ -5487,8 +5841,18 @@ class MainWindow(QMainWindow):
         )
 
         self.resize(
-            1500,
-            900,
+            int(
+                state_store.get(
+                    "ui.window_width",
+                    1500,
+                )
+            ),
+            int(
+                state_store.get(
+                    "ui.window_height",
+                    900,
+                )
+            ),
         )
 
         self.machine = (
@@ -5516,6 +5880,7 @@ class MainWindow(QMainWindow):
 
         self.jobs = JobManager()
         self.poll_worker = None
+        self.execution_worker = None
 
         # ----------------------------------------------------
         # Panels
@@ -5597,6 +5962,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(
             Qt.Horizontal
         )
+        self.splitter = splitter
 
         splitter.addWidget(left)
         splitter.addWidget(
@@ -5606,12 +5972,19 @@ class MainWindow(QMainWindow):
             self.properties
         )
 
+        default_sizes = [
+            300,
+            900,
+            350,
+        ]
+        saved_sizes = state_store.get(
+            "ui.splitter_sizes",
+            default_sizes,
+        )
+        if not isinstance(saved_sizes, list):
+            saved_sizes = default_sizes
         splitter.setSizes(
-            [
-                300,
-                900,
-                350,
-            ]
+            [int(v) for v in saved_sizes]
         )
 
         splitter.setStretchFactor(
@@ -5663,6 +6036,21 @@ class MainWindow(QMainWindow):
 
         self.properties.converted.connect(
             self.conversion_finished
+        )
+        self.machine_panel.startRequested.connect(
+            self.start_execution
+        )
+        self.machine_panel.pauseRequested.connect(
+            self.pause_execution
+        )
+        self.machine_panel.resumeRequested.connect(
+            self.resume_execution
+        )
+        self.machine_panel.stopRequested.connect(
+            self.stop_execution
+        )
+        self.machine_panel.feedOverrideChanged.connect(
+            self.set_feed_override
         )
 
         # ----------------------------------------------------
@@ -5826,6 +6214,98 @@ class MainWindow(QMainWindow):
         self.machine.state.message = message
 
         self.machine_panel.update_state()
+
+    def _active_gcode_jobs(self):
+        result = []
+        for job in self.jobs.jobs:
+            if not getattr(job, "active", False):
+                continue
+            source_type = str(
+                getattr(job, "source_type", "")
+            ).lower()
+            if "gcode" not in source_type:
+                continue
+            result.append(job)
+        return result
+
+    def start_execution(self):
+        if not self.machine.state.connected:
+            show_warning(
+                self,
+                "Execution",
+                "Connect to the machine first.",
+            )
+            return
+
+        if (
+            self.execution_worker is not None
+            and self.execution_worker.isRunning()
+        ):
+            return
+
+        jobs = self._active_gcode_jobs()
+        self.execution_worker = ExecutionWorker(
+            self.machine,
+            jobs,
+        )
+        self.execution_worker.progress.connect(
+            self.machine_panel.status.setText
+        )
+        self.execution_worker.finished.connect(
+            self.execution_finished
+        )
+        self.execution_worker.start()
+
+    def pause_execution(self):
+        if self.execution_worker is None:
+            return
+        self.execution_worker.pause()
+        try:
+            self.machine.send_command("!")
+        except Exception:
+            pass
+        self.machine_panel.status.setText("Paused")
+
+    def resume_execution(self):
+        if self.execution_worker is None:
+            return
+        self.execution_worker.resume()
+        try:
+            self.machine.send_command("~")
+        except Exception:
+            pass
+        self.machine_panel.status.setText("Resumed")
+
+    def stop_execution(self):
+        if self.execution_worker is None:
+            return
+        self.execution_worker.stop()
+        try:
+            self.machine.send_command("M0")
+        except Exception:
+            pass
+        self.machine_panel.status.setText("Stopping...")
+
+    def execution_finished(self, message):
+        self.machine_panel.status.setText(message)
+        worker = self.execution_worker
+        if worker is not None:
+            worker.deleteLater()
+        self.execution_worker = None
+
+    def set_feed_override(self, value):
+        if not self.machine.state.connected:
+            return
+        try:
+            self.machine.send_command(
+                f"M220 S{int(value)}"
+            )
+        except Exception as exc:
+            show_warning(
+                self,
+                "Feed override failed",
+                str(exc),
+            )
 
 
 # ============================================================
@@ -6151,6 +6631,16 @@ if __name__ == "__main__":
                 # The worker is performing controller I/O.
                 # Do not block application shutdown indefinitely.
                 pass
+
+        execution_worker = getattr(
+            self,
+            "execution_worker",
+            None,
+        )
+        if execution_worker is not None and execution_worker.isRunning():
+            execution_worker.stop()
+            execution_worker.quit()
+            execution_worker.wait(1000)
 
         try:
             if self.machine.state.connected:
