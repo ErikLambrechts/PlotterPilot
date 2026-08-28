@@ -2688,6 +2688,20 @@ class MachinePanel(QFrame):
             QLabel("<b>Machine</b>")
         )
 
+        status_row = QHBoxLayout()
+        self.connection_indicator = QLabel("●")
+        self.connection_indicator.setFixedWidth(14)
+        status_row.addWidget(
+            self.connection_indicator
+        )
+
+        self.status = QLabel(
+            "Disconnected"
+        )
+        status_row.addWidget(self.status)
+        status_row.addStretch()
+        layout.addLayout(status_row)
+
         connection = QGroupBox("Connection")
         connection_layout = QVBoxLayout(connection)
 
@@ -2720,7 +2734,13 @@ class MachinePanel(QFrame):
         row.addWidget(self.port)
         connection_layout.addLayout(row)
 
-        layout.addWidget(connection)
+        layout.addWidget(
+            CollapsibleSection(
+                "Connection settings",
+                connection,
+                expanded=False,
+            )
+        )
 
         self.connect_button = QPushButton(
             "Connect"
@@ -2732,14 +2752,6 @@ class MachinePanel(QFrame):
 
         layout.addWidget(
             self.connect_button
-        )
-
-        self.status = QLabel(
-            "Disconnected"
-        )
-
-        layout.addWidget(
-            self.status
         )
 
         self.position = QLabel(
@@ -2788,6 +2800,33 @@ class MachinePanel(QFrame):
         )
 
         row.addWidget(self.step)
+
+        self.step_preset = QComboBox()
+        for value in (
+            0.01,
+            0.05,
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+            50,
+            100,
+            500,
+            1000,
+        ):
+            self.step_preset.addItem(
+                f"{value:g}",
+                float(value),
+            )
+        self.step_preset.currentIndexChanged.connect(
+            self.select_step_preset
+        )
+        row.addWidget(
+            QLabel("Preset")
+        )
+        row.addWidget(self.step_preset)
+        self.sync_step_preset()
 
         layout.addLayout(row)
 
@@ -3087,6 +3126,33 @@ class MachinePanel(QFrame):
             "machine.jog_step",
             self.step.value(),
         )
+        self.sync_step_preset()
+
+    def select_step_preset(self, index):
+        value = self.step_preset.itemData(index)
+        if value is None:
+            return
+        self.step.blockSignals(True)
+        self.step.setValue(float(value))
+        self.step.blockSignals(False)
+        self.persist_settings()
+
+    def sync_step_preset(self):
+        value = self.step.value()
+        index = -1
+        for i in range(self.step_preset.count()):
+            candidate = self.step_preset.itemData(i)
+            if candidate is None:
+                continue
+            if abs(float(candidate) - float(value)) < 1e-9:
+                index = i
+                break
+        self.step_preset.blockSignals(True)
+        if index >= 0:
+            self.step_preset.setCurrentIndex(index)
+        else:
+            self.step_preset.setCurrentIndex(-1)
+        self.step_preset.blockSignals(False)
 
     def update_state(self):
         """Refresh the machine status without performing I/O."""
@@ -3128,6 +3194,9 @@ class MachinePanel(QFrame):
             self.connect_button.setText(
                 "Disconnect"
             )
+            self.connection_indicator.setStyleSheet(
+                "color: #2f9e44;"
+            )
 
         else:
             self.status.setText(
@@ -3148,6 +3217,19 @@ class MachinePanel(QFrame):
 
             self.connect_button.setText(
                 "Connect"
+            )
+            state_text = str(
+                getattr(
+                    state,
+                    "state",
+                    "Disconnected",
+                )
+            ).lower()
+            color = "#868e96"
+            if "failed" in state_text or "lost" in state_text or "error" in state_text:
+                color = "#c92a2a"
+            self.connection_indicator.setStyleSheet(
+                f"color: {color};"
             )
 
 class JobListPanel(QFrame):
