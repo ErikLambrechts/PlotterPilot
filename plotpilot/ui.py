@@ -1197,7 +1197,17 @@ class JobPropertiesPanel(QFrame):
                     ).lower()
 
                     if parameter_type == "boolean":
-                        value = bool(value)
+                        if isinstance(value, bool):
+                            pass
+                        elif value is None:
+                            value = False
+                        else:
+                            value = str(value).strip().lower() in {
+                                "1",
+                                "true",
+                                "yes",
+                                "on",
+                            }
 
                     elif parameter_type == "number":
                         try:
@@ -2069,6 +2079,7 @@ class MainWindow(QMainWindow):
         )
 
         self.jobs = JobManager()
+        self.poll_worker = None
 
         # ----------------------------------------------------
         # Panels

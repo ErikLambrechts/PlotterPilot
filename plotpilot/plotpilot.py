@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import socket
@@ -113,8 +114,38 @@ class MachineConfig:
     host: str
     port: int
     workspace: Workspace
+    log_level: str = "INFO"
     profiles: list[ConversionProfile] = field(
         default_factory=list
+    )
+
+
+logger = logging.getLogger(__name__)
+
+
+def show_warning(parent, title, message):
+    logger.warning(
+        "%s: %s",
+        title,
+        message,
+    )
+    QMessageBox.warning(
+        parent,
+        title,
+        str(message),
+    )
+
+
+def show_critical(parent, title, message):
+    logger.error(
+        "%s: %s",
+        title,
+        message,
+    )
+    QMessageBox.critical(
+        parent,
+        title,
+        str(message),
     )
 
 
@@ -259,6 +290,9 @@ def load_config(path: Path) -> MachineConfig:
 
     host = machine.get("host", "192.168.4.1")
     port = machine.get("port", 80)
+    log_level = str(
+        machine.get("log_level", "INFO")
+    )
 
     # --------------------------------------------------------
     # --------------------------------------------------------
@@ -466,6 +500,7 @@ def load_config(path: Path) -> MachineConfig:
             ),
             anchors=anchors,
         ),
+        log_level=log_level,
         profiles=profiles,
     )
 
@@ -2689,6 +2724,22 @@ class MachinePanel(QFrame):
             self.position
         )
 
+        command_row = QHBoxLayout()
+        self.gcode_input = QLineEdit()
+        self.gcode_input.setPlaceholderText(
+            "Send G-code command"
+        )
+        send_gcode = QPushButton("Send")
+        send_gcode.clicked.connect(
+            self.send_gcode_command
+        )
+        self.gcode_input.returnPressed.connect(
+            self.send_gcode_command
+        )
+        command_row.addWidget(self.gcode_input)
+        command_row.addWidget(send_gcode)
+        layout.addLayout(command_row)
+
         layout.addWidget(
             QLabel("<b>Jog</b>")
         )
@@ -2923,7 +2974,7 @@ class MachinePanel(QFrame):
             f"Connection failed: {message}"
         )
 
-        QMessageBox.warning(
+        show_warning(
             self,
             "Connection failed",
             str(message),
@@ -2966,6 +3017,28 @@ class MachinePanel(QFrame):
         except Exception as exc:
             self.status.setText(
                 f"Error: {exc}"
+            )
+
+    def send_gcode_command(self):
+        command = self.gcode_input.text().strip()
+
+        if not command:
+            return
+
+        try:
+            response = self.machine.send_command(
+                command
+            )
+            if response:
+                self.status.setText(
+                    response.strip()
+                )
+            self.gcode_input.clear()
+        except Exception as exc:
+            show_warning(
+                self,
+                "Command failed",
+                str(exc),
             )
 
     def update_state(self):
@@ -3206,7 +3279,7 @@ class JobListPanel(QFrame):
 
             except Exception as exc:
 
-                QMessageBox.warning(
+                show_warning(
                     self,
                     "Cannot add file",
                     str(exc),
@@ -3394,7 +3467,16 @@ class PipelineDialog(QDialog):
 
             if p_type == "boolean":
                 editor = QCheckBox()
-                editor.setChecked(bool(value))
+                editor.setChecked(
+                    str(value).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+                    if not isinstance(value, bool)
+                    else value
+                )
                 editor.toggled.connect(
                     lambda checked, n=name, r=row:
                     self._set_param(r, n, checked)
@@ -3832,6 +3914,7 @@ class JobPropertiesPanel(QFrame):
             # a parameter dictionary.  Show editable values where
             # possible without requiring a specific profile class.
             self.parameter_widgets = {}
+            self.parameter_specs = {}
 
             def rebuild_parameters():
                 while params_layout.count():
@@ -3859,12 +3942,27 @@ class JobPropertiesPanel(QFrame):
                     parameters = {}
 
                 self.parameter_widgets.clear()
+                self.parameter_specs.clear()
 
                 for name, specification in parameters.items():
                     row = QHBoxLayout()
 
                     row.addWidget(
                         QLabel(str(name))
+                    )
+
+                    spec_type = (
+                        str(
+                            specification.get(
+                                "type",
+                                "string",
+                            )
+                        ).lower()
+                        if isinstance(
+                            specification,
+                            dict,
+                        )
+                        else "string"
                     )
 
                     value = (
@@ -3876,21 +3974,31 @@ class JobPropertiesPanel(QFrame):
                         else specification
                     )
 
-                    if isinstance(value, bool):
+                    if spec_type == "boolean":
                         widget = QCheckBox()
-                        widget.setChecked(value)
+                        widget.setChecked(
+                            self._coerce_bool(value)
+                        )
 
-                    elif isinstance(
-                        value,
-                        (int, float),
-                    ):
+                    elif spec_type in {
+                        "number",
+                        "integer",
+                    }:
                         widget = QDoubleSpinBox()
                         widget.setRange(
                             -1000000,
                             1000000,
                         )
                         widget.setDecimals(4)
-                        widget.setValue(float(value))
+                        try:
+                            widget.setValue(
+                                float(value)
+                            )
+                        except (
+                            TypeError,
+                            ValueError,
+                        ):
+                            widget.setValue(0.0)
 
                     else:
                         widget = QLineEdit(
@@ -3908,6 +4016,19 @@ class JobPropertiesPanel(QFrame):
                     )
 
                     self.parameter_widgets[name] = widget
+                    if isinstance(
+                        specification,
+                        dict,
+                    ):
+                        self.parameter_specs[
+                            str(name)
+                        ] = dict(specification)
+                    else:
+                        self.parameter_specs[
+                            str(name)
+                        ] = {
+                            "type": "string"
+                        }
 
                 params_layout.addStretch()
 
@@ -3940,7 +4061,13 @@ class JobPropertiesPanel(QFrame):
             )
 
             pipeline = QPushButton(
-                "Add pipeline"
+                "Edit pipeline"
+                if getattr(
+                    job,
+                    "pipeline_steps",
+                    [],
+                )
+                else "Add pipeline"
             )
             pipeline.clicked.connect(
                 self.configure_pipeline
@@ -4472,6 +4599,73 @@ class JobPropertiesPanel(QFrame):
                 return profile
         return None
 
+    def _coerce_bool(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _append_parameter_args(
+        self,
+        command,
+        profile,
+        parameters,
+    ):
+        profile_parameters = getattr(
+            profile,
+            "parameters",
+            {},
+        )
+        if not isinstance(profile_parameters, dict):
+            profile_parameters = {}
+
+        for name, value in parameters.items():
+            if value is None:
+                continue
+
+            option = f"--{name}"
+
+            specification = profile_parameters.get(
+                name,
+                {},
+            )
+            parameter_type = (
+                str(
+                    specification.get(
+                        "type",
+                        "",
+                    )
+                ).lower()
+                if isinstance(
+                    specification,
+                    dict,
+                )
+                else ""
+            )
+
+            if parameter_type == "boolean":
+                if self._coerce_bool(value):
+                    command.append(option)
+                continue
+
+            if isinstance(value, bool):
+                if value:
+                    command.append(option)
+                continue
+
+            command.extend(
+                [
+                    option,
+                    str(value),
+                ]
+            )
+
     def pipeline_text(self, job):
         steps = getattr(job, "pipeline_steps", [])
 
@@ -4634,25 +4828,14 @@ class JobPropertiesPanel(QFrame):
                     ]
                 )
 
-                for name, value in step.get(
-                    "parameters",
-                    {},
-                ).items():
-                    if value is None:
-                        continue
-
-                    option = f"--{name}"
-
-                    if isinstance(value, bool):
-                        if value:
-                            command.append(option)
-                    else:
-                        command.extend(
-                            [
-                                option,
-                                str(value),
-                            ]
-                        )
+                self._append_parameter_args(
+                    command,
+                    step_profile,
+                    step.get(
+                        "parameters",
+                        {},
+                    ),
+                )
 
                 result = subprocess.run(
                     command,
@@ -4744,7 +4927,7 @@ class JobPropertiesPanel(QFrame):
             )
 
         except Exception as exc:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 "Conversion failed",
                 str(exc),
@@ -4774,7 +4957,7 @@ class JobPropertiesPanel(QFrame):
                     encoding="utf-8"
                 )
             except Exception as exc:
-                QMessageBox.critical(
+                show_critical(
                     self,
                     "Save failed",
                     str(exc),
@@ -4801,7 +4984,7 @@ class JobPropertiesPanel(QFrame):
             self.job.name = Path(filename).name
 
         except Exception as exc:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 "Save failed",
                 str(exc),
@@ -4843,6 +5026,7 @@ class MainWindow(QMainWindow):
         )
 
         self.jobs = JobManager()
+        self.poll_worker = None
 
         # ----------------------------------------------------
         # Panels
@@ -5075,7 +5259,7 @@ class MainWindow(QMainWindow):
 
         except Exception as exc:
 
-            QMessageBox.warning(
+            show_warning(
                 self,
                 "Machine move failed",
                 str(exc),
@@ -5260,6 +5444,14 @@ def main():
 
     config = load_config(
         config_path
+    )
+    logging.basicConfig(
+        level=getattr(
+            logging,
+            str(config.log_level).upper(),
+            logging.INFO,
+        ),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
     cleanup_conversion_temp()
