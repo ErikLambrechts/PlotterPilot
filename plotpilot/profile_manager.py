@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +26,8 @@ class ConversionProfile:
     name: str
     path: Path
     description: str = ""
+    input_type: str | None = None
+    output_type: str | None = None
     parameters: list[ProfileParameter] = field(
         default_factory=list
     )
@@ -33,7 +39,7 @@ class ConversionProfile:
 
 
 def discover_profiles(
-    directory: Path,
+    location: Path,
 ) -> list[ConversionProfile]:
     """
     Discover conversion profiles.
@@ -45,37 +51,77 @@ def discover_profiles(
     The returned JSON defines the profile interface.
     """
 
-    directory = Path(directory).resolve()
+    location = Path(location).resolve()
 
     profiles: list[ConversionProfile] = []
 
-    if not directory.is_dir():
+    scripts: list[Path] = []
+
+    if location.is_dir():
+        scripts = sorted(
+            candidate
+            for candidate in location.iterdir()
+            if candidate.is_file()
+            and candidate.suffix.lower()
+            in {".sh", ".py"}
+        )
+    elif location.is_file():
+        if location.suffix.lower() in {
+            ".sh",
+            ".py",
+        }:
+            scripts = [location]
+    else:
+        logger.info(
+            "Profile location does not exist: %s",
+            location,
+        )
         return profiles
 
-    for script in sorted(directory.glob("*.sh")):
+    for script in scripts:
 
         if not script.is_file():
             continue
 
         try:
             result = subprocess.run(
-                [str(script), "--json"],
+                _profile_command(
+                    script,
+                    "--json",
+                ),
                 capture_output=True,
                 text=True,
                 check=False,
             )
         except OSError:
+            logger.exception(
+                "Unable to execute profile metadata command: %s",
+                script,
+            )
             continue
 
         if result.returncode != 0:
+            logger.warning(
+                "Profile %s returned non-zero --json exit code: %s",
+                script,
+                result.returncode,
+            )
             continue
 
         try:
             spec = json.loads(result.stdout)
         except json.JSONDecodeError:
+            logger.warning(
+                "Profile %s returned invalid JSON",
+                script,
+            )
             continue
 
         if not isinstance(spec, dict):
+            logger.warning(
+                "Profile %s JSON root must be an object",
+                script,
+            )
             continue
 
         raw_parameters = spec.get(
@@ -157,12 +203,36 @@ def discover_profiles(
             "",
         )
 
+        raw_input = spec.get("input", {})
+        raw_output = spec.get("output", {})
+
+        input_type = (
+            raw_input.get("type")
+            if isinstance(raw_input, dict)
+            else None
+        )
+        output_type = (
+            raw_output.get("type")
+            if isinstance(raw_output, dict)
+            else None
+        )
+
         profiles.append(
             ConversionProfile(
                 name=str(name),
                 path=script,
                 description=str(
                     description
+                ),
+                input_type=(
+                    str(input_type)
+                    if input_type is not None
+                    else None
+                ),
+                output_type=(
+                    str(output_type)
+                    if output_type is not None
+                    else None
                 ),
                 parameters=parameters,
                 spec=spec,
@@ -180,6 +250,24 @@ def profile_to_json(
         "name": profile.name,
         "path": str(profile.path),
         "description": profile.description,
+        **(
+            {
+                "input": {
+                    "type": profile.input_type
+                }
+            }
+            if profile.input_type
+            else {}
+        ),
+        **(
+            {
+                "output": {
+                    "type": profile.output_type
+                }
+            }
+            if profile.output_type
+            else {}
+        ),
         "parameters": {
             parameter.name: {
                 "type": parameter.type,
@@ -230,7 +318,7 @@ def convert_svg(
     parameters = parameters or {}
 
     command = [
-        str(profile.path),
+        *_profile_command(profile.path),
         "--input",
         str(input_file),
         "--output",
@@ -282,3 +370,13 @@ def convert_svg(
         )
 
     return output_file
+
+
+def _profile_command(
+    profile_path: Path,
+    *extra: str,
+) -> list[str]:
+    if profile_path.suffix.lower() == ".py":
+        return [sys.executable, str(profile_path), *extra]
+
+    return [str(profile_path), *extra]

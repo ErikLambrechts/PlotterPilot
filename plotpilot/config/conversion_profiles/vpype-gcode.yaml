@@ -1,0 +1,47 @@
+[gwrite.my_gcode]
+unit = "mm"
+vertical_flip = true
+
+document_start = """G21
+G17
+G90
+"""
+
+# Before each color/layer.
+# Replace the M6 line with whatever your machine uses for a tool/color change.
+layer_start = """\
+; COLOR {vp_color}
+M5
+G0 Z5
+M6
+; TOOL/COLOR CHANGE: {vp_color}
+"""
+
+# Between colors/layers.
+layer_join = """\
+; END COLOR
+G0 Z5
+"""
+
+line_start = """\
+G0 Z5
+G0 X{x:.4f} Y{y:.4f}
+G1 Z0 F1000
+"""
+
+segment = "G1 X{x:.4f} Y{y:.4f} F3000\n"
+
+line_end = """\
+G0 Z5
+"""
+
+layer_end = """\
+; FINISHED COLOR {vp_color}
+"""
+
+document_end = """\
+M5
+G0 Z5
+G0 X0 Y0
+M2
+"""

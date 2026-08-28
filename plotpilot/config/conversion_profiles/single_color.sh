@@ -31,16 +31,16 @@ CLI_SPEC='
   },
 
   "parameters": {
-    "profile": {
-      "type": "string",
-      "default": "single-color",
-      "description": "Conversion profile"
+    "flip_vertical": {
+      "type": "boolean",
+      "default": "false",
+      "description": "flip vertical axis"
     },
 
-    "scale": {
+    "feed_rate": {
       "type": "number",
-      "default": 1.0,
-      "description": "SVG scale"
+      "default": 3000,
+      "description": "feed rate"
     }
   }
 }
@@ -48,50 +48,62 @@ CLI_SPEC='
 
 cli_init "$CLI_SPEC" "$@"
 
-# ------------------------------------------------------------
-# The converter itself works on files.
-#
-# The CLI transport does not.
-#
-# This means:
-#
-#   file -> converter -> file
-#
-# and:
-#
-#   stdin -> temporary input -> converter -> stdout
-#
-# use exactly the same conversion implementation.
-# ------------------------------------------------------------
-
 INPUT_TMP="$(mktemp --suffix=.svg)"
 OUTPUT_TMP="$(mktemp --suffix=.gcode)"
+CONFIG="$(mktemp --suffix=.toml)"
 
 cleanup() {
-    rm -f "$INPUT_TMP" "$OUTPUT_TMP"
+    rm -f "$INPUT_TMP" "$OUTPUT_TMP" "$CONFIG"
 }
 
 trap cleanup EXIT
 
 cli_read_input > "$INPUT_TMP"
 
-PROJECT_ROOT="$(
-    cd "$SCRIPT_DIR/../../.." &&
-    pwd
-)"
-
 # ------------------------------------------------------------
-# Use the existing PlotPilot SVG -> G-code converter.
-#
-# The profile-specific settings are passed through the
-# existing conversion interface.
+# Generate the vpype-gcode profile.
 # ------------------------------------------------------------
 
-PYTHONPATH="$PROJECT_ROOT" \
-python -m plotpilot.converters.svg_to_gcode.pipeline \
-    "$INPUT_TMP" \
-    "$OUTPUT_TMP" \
-    --profile "$profile" \
-    --scale "$scale"
+cat > "$CONFIG" <<EOF
+[gwrite.simple]
+unit = "mm"
+vertical_flip = ${flip_vertical}
+
+document_start = """\
+G21
+G17
+G90
+"""
+
+line_start = """\
+G0 Z5
+G0 X{x:.4f} Y{y:.4f}
+G1 Z0 F1000
+"""
+
+segment = "G1 X{x:.4f} Y{y:.4f} F${feed_rate}\n"
+
+line_end = """\
+G0 Z5
+"""
+
+document_end = """\
+M5
+G0 Z5
+G0 X0 Y0
+M2
+"""
+EOF
+
+# ------------------------------------------------------------
+# SVG -> optimized single-color G-code.
+# ------------------------------------------------------------
+
+vpype --config "$CONFIG" \
+    read "$INPUT_TMP" \
+    linemerge --tolerance 0.1mm \
+    linesimplify --tolerance 0.05mm \
+    linesort \
+    gwrite -p simple "$OUTPUT_TMP"
 
 cli_write_file "$OUTPUT_TMP"

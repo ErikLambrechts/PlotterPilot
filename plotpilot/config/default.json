@@ -2,6 +2,7 @@
   "machine": {
     "host": "fluidnc.local",
     "port": 80,
+    "log_level": "INFO",
     "workspace": {
       "width": 500,
       "height": 500,
