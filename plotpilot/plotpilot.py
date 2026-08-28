@@ -65,6 +65,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QDialog,
     QDialogButtonBox,
+    QInputDialog,
+    QSlider,
 )
 try:
     from .state_store import StateStore
@@ -119,6 +121,8 @@ class MachineConfig:
     port: int
     workspace: Workspace
     log_level: str = "INFO"
+    config_path: Path | None = None
+    pipelines: dict = field(default_factory=dict)
     profiles: list[ConversionProfile] = field(
         default_factory=list
     )
@@ -168,6 +172,35 @@ def profile_command(
     return [str(profile_path), *args]
 
 
+def save_pipelines_to_config(
+    config_path: Path,
+    pipelines: dict,
+):
+    try:
+        payload = json.loads(
+            config_path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    machine = payload.get("machine")
+    if not isinstance(machine, dict):
+        machine = {}
+        payload["machine"] = machine
+
+    machine["pipelines"] = pipelines
+
+    config_path.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+
 def load_config(path: Path) -> MachineConfig:
     """
     Load PlotPilot configuration.
@@ -192,6 +225,8 @@ def load_config(path: Path) -> MachineConfig:
     Profiles are passed through by the rest of the application and are
     therefore not interpreted here.
     """
+
+    path = Path(path).resolve()
 
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -298,6 +333,9 @@ def load_config(path: Path) -> MachineConfig:
     log_level = str(
         machine.get("log_level", "INFO")
     )
+    pipelines = machine.get("pipelines", {})
+    if not isinstance(pipelines, dict):
+        pipelines = {}
 
     # --------------------------------------------------------
     # --------------------------------------------------------
@@ -506,6 +544,8 @@ def load_config(path: Path) -> MachineConfig:
             anchors=anchors,
         ),
         log_level=log_level,
+        config_path=path,
+        pipelines=pipelines,
         profiles=profiles,
     )
 
@@ -3468,6 +3508,38 @@ class JobListPanel(QFrame):
 # ============================================================
 
 
+class StepPickerDialog(QDialog):
+    def __init__(self, parent, profiles):
+        super().__init__(parent)
+        self.setWindowTitle("Add processing step")
+        self.resize(420, 420)
+        self.profiles = profiles
+
+        layout = QVBoxLayout(self)
+        self.list = QListWidget()
+
+        for profile in profiles:
+            self.list.addItem(
+                f"{profile.name} ({profile.input_type or '?'} → {profile.output_type or '?'})"
+            )
+
+        layout.addWidget(self.list)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok
+            | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_profile(self):
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.profiles):
+            return None
+        return self.profiles[row]
+
+
 class PipelineDialog(QDialog):
 
     def __init__(
@@ -3488,25 +3560,26 @@ class PipelineDialog(QDialog):
         layout = QVBoxLayout(self)
 
         top = QHBoxLayout()
-        self.profile_combo = QComboBox()
-
-        for profile in self.profiles:
-            self.profile_combo.addItem(
-                profile.name,
-                profile.name,
-            )
-
         add_step = QPushButton("Add step")
         add_step.clicked.connect(self.add_step)
-        remove_step = QPushButton("Remove step")
-        remove_step.clicked.connect(
+        self.remove_step_button = QPushButton("Remove step")
+        self.remove_step_button.clicked.connect(
             self.remove_step
         )
+        self.move_up_button = QPushButton("Move up")
+        self.move_up_button.clicked.connect(
+            self.move_up
+        )
+        self.move_down_button = QPushButton("Move down")
+        self.move_down_button.clicked.connect(
+            self.move_down
+        )
 
-        top.addWidget(QLabel("Profile"))
-        top.addWidget(self.profile_combo)
         top.addWidget(add_step)
-        top.addWidget(remove_step)
+        top.addWidget(self.remove_step_button)
+        top.addWidget(self.move_up_button)
+        top.addWidget(self.move_down_button)
+        top.addStretch()
         layout.addLayout(top)
 
         body = QHBoxLayout()
@@ -3540,8 +3613,15 @@ class PipelineDialog(QDialog):
         self.refresh_steps()
 
     def add_step(self):
-        profile_name = self.profile_combo.currentData()
-        profile = self._profile(profile_name)
+        picker = StepPickerDialog(
+            self,
+            self.profiles,
+        )
+
+        if picker.exec() != QDialog.Accepted:
+            return
+
+        profile = picker.selected_profile()
 
         if profile is None:
             return
@@ -3575,6 +3655,28 @@ class PipelineDialog(QDialog):
         self.steps.pop(row)
         self.refresh_steps()
 
+    def move_up(self):
+        row = self.step_list.currentRow()
+        if row <= 0:
+            return
+        self.steps[row - 1], self.steps[row] = (
+            self.steps[row],
+            self.steps[row - 1],
+        )
+        self.refresh_steps()
+        self.step_list.setCurrentRow(row - 1)
+
+    def move_down(self):
+        row = self.step_list.currentRow()
+        if row < 0 or row >= len(self.steps) - 1:
+            return
+        self.steps[row + 1], self.steps[row] = (
+            self.steps[row],
+            self.steps[row + 1],
+        )
+        self.refresh_steps()
+        self.step_list.setCurrentRow(row + 1)
+
     def select_step(self, row):
         while self.parameters_layout.count():
             item = self.parameters_layout.takeAt(0)
@@ -3583,8 +3685,10 @@ class PipelineDialog(QDialog):
                 widget.deleteLater()
 
         if row < 0 or row >= len(self.steps):
+            self._update_step_actions(-1)
             self.parameters_layout.addStretch()
             return
+        self._update_step_actions(row)
 
         step = self.steps[row]
         profile = self._profile(step.get("profile"))
@@ -3724,6 +3828,14 @@ class PipelineDialog(QDialog):
         self.preview.setText(self._pipeline_preview())
         self.select_step(self.step_list.currentRow())
 
+    def _update_step_actions(self, row):
+        valid = 0 <= row < len(self.steps)
+        self.remove_step_button.setEnabled(valid)
+        self.move_up_button.setEnabled(valid and row > 0)
+        self.move_down_button.setEnabled(
+            valid and row < len(self.steps) - 1
+        )
+
     def _pipeline_preview(self):
         stage = self.source_type
         parts = [stage]
@@ -3753,6 +3865,11 @@ class PipelineDialog(QDialog):
 
         if warnings:
             summary += "\n⚠ " + "\n⚠ ".join(warnings)
+            self.preview.setStyleSheet(
+                "color: #c92a2a; font-weight: 600;"
+            )
+        else:
+            self.preview.setStyleSheet("")
 
         return summary
 
@@ -3771,6 +3888,8 @@ class JobPropertiesPanel(QFrame):
         workspace,
         profiles=None,
         preview=None,
+        pipeline_library=None,
+        config_path=None,
     ):
         super().__init__()
         print(
@@ -3787,6 +3906,12 @@ class JobPropertiesPanel(QFrame):
         self.profiles = profiles or []
         self.preview = preview
         self.job = None
+        self.pipeline_library = (
+            pipeline_library
+            if isinstance(pipeline_library, dict)
+            else {}
+        )
+        self.config_path = config_path
 
         layout = QVBoxLayout(self)
 
@@ -4274,6 +4399,58 @@ class JobPropertiesPanel(QFrame):
             conversion_layout.addWidget(
                 self.pipeline_summary
             )
+
+            pipeline_row = QHBoxLayout()
+            pipeline_row.addWidget(
+                QLabel("Saved pipeline")
+            )
+            self.pipeline_combo = QComboBox()
+            self.pipeline_combo.addItem(
+                "Custom",
+                None,
+            )
+            for name in sorted(
+                self.pipeline_library.keys()
+            ):
+                self.pipeline_combo.addItem(
+                    name,
+                    name,
+                )
+            self.pipeline_combo.currentIndexChanged.connect(
+                self.apply_saved_pipeline
+            )
+            pipeline_row.addWidget(
+                self.pipeline_combo
+            )
+
+            save_pipeline = QPushButton(
+                "Save pipeline"
+            )
+            save_pipeline.clicked.connect(
+                self.save_pipeline
+            )
+            pipeline_row.addWidget(
+                save_pipeline
+            )
+            conversion_layout.addLayout(
+                pipeline_row
+            )
+
+            active_name = self.find_saved_pipeline_name(
+                getattr(
+                    job,
+                    "pipeline_steps",
+                    [],
+                )
+            )
+            if active_name:
+                index = self.pipeline_combo.findData(
+                    active_name
+                )
+                if index >= 0:
+                    self.pipeline_combo.setCurrentIndex(
+                        index
+                    )
 
             self.content_layout.addWidget(
                 conversion
@@ -4896,6 +5073,12 @@ class JobPropertiesPanel(QFrame):
 
         return "Pipeline: " + " → ".join(parts)
 
+    def find_saved_pipeline_name(self, steps):
+        for name, candidate in self.pipeline_library.items():
+            if candidate == steps:
+                return name
+        return None
+
     def configure_pipeline(self):
         if not self.job:
             return
@@ -4924,8 +5107,89 @@ class JobPropertiesPanel(QFrame):
             self.pipeline_summary.setText(
                 self.pipeline_text(self.job)
             )
+        if hasattr(self, "pipeline_combo"):
+            self.pipeline_combo.blockSignals(True)
+            self.pipeline_combo.setCurrentIndex(0)
+            self.pipeline_combo.blockSignals(False)
 
         self.changed.emit()
+
+    def apply_saved_pipeline(self, _index):
+        if not self.job:
+            return
+
+        if not hasattr(self, "pipeline_combo"):
+            return
+
+        name = self.pipeline_combo.currentData()
+        if not name:
+            return
+
+        steps = self.pipeline_library.get(name)
+        if not isinstance(steps, list):
+            return
+
+        self.job.pipeline_steps = [
+            dict(step)
+            for step in steps
+        ]
+
+        if hasattr(self, "pipeline_summary"):
+            self.pipeline_summary.setText(
+                self.pipeline_text(self.job)
+            )
+        self.changed.emit()
+
+    def save_pipeline(self):
+        if not self.job:
+            return
+
+        if not getattr(self.job, "pipeline_steps", []):
+            show_warning(
+                self,
+                "Save pipeline",
+                "No pipeline steps to save.",
+            )
+            return
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Save pipeline",
+            "Pipeline name:",
+        )
+
+        name = str(name).strip()
+        if not ok or not name:
+            return
+
+        self.pipeline_library[name] = [
+            dict(step)
+            for step in self.job.pipeline_steps
+        ]
+
+        if self.config_path:
+            try:
+                save_pipelines_to_config(
+                    Path(self.config_path),
+                    self.pipeline_library,
+                )
+            except Exception as exc:
+                show_warning(
+                    self,
+                    "Save pipeline",
+                    str(exc),
+                )
+                return
+
+        if hasattr(self, "pipeline_combo"):
+            if self.pipeline_combo.findData(name) < 0:
+                self.pipeline_combo.addItem(
+                    name,
+                    name,
+                )
+            self.pipeline_combo.setCurrentIndex(
+                self.pipeline_combo.findData(name)
+            )
 
     # --------------------------------------------------------
     # Conversion / save
@@ -5241,6 +5505,14 @@ class MainWindow(QMainWindow):
         self.profiles = (
             config.profiles
         )
+        self.pipeline_library = dict(
+            getattr(config, "pipelines", {})
+        )
+        self.config_path = getattr(
+            config,
+            "config_path",
+            None,
+        )
 
         self.jobs = JobManager()
         self.poll_worker = None
@@ -5299,6 +5571,8 @@ class MainWindow(QMainWindow):
                 config.workspace,
                 self.profiles,
                 self.workspace,
+                self.pipeline_library,
+                self.config_path,
             )
         )
 
