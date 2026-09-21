@@ -12,7 +12,7 @@ source "$SCRIPT_DIR/../../lib/cli.sh"
 CLI_SPEC='
 {
   "name": "single-color",
-  "description": "Convert SVG to single-color G-code",
+  "description": "Convert SVG to optimized single-color G-code",
 
   "input": {
     "type": "svg",
@@ -40,7 +40,19 @@ CLI_SPEC='
     "feed_rate": {
       "type": "number",
       "default": 3000,
-      "description": "feed rate"
+      "description": "drawing feed rate"
+    },
+
+    "travel_height": {
+      "type": "number",
+      "default": 5,
+      "description": "Z height used for travel moves"
+    },
+
+    "draw_height": {
+      "type": "number",
+      "default": 0,
+      "description": "Z height used while drawing"
     }
   }
 }
@@ -67,7 +79,7 @@ cli_read_input > "$INPUT_TMP"
 cat > "$CONFIG" <<EOF
 [gwrite.simple]
 unit = "mm"
-vertical_flip = ${flip_vertical}
+invert_y = ${flip_vertical}
 
 document_start = """\
 G21
@@ -75,28 +87,32 @@ G17
 G90
 """
 
-line_start = """\
-G0 Z5
-G0 X{x:.4f} Y{y:.4f}
-G1 Z0 F1000
+segment_first = """\
+G00 Z${travel_height}
+G00 X{x:.4f} Y{y:.4f}
+G01 Z${draw_height} F1000
 """
 
-segment = "G1 X{x:.4f} Y{y:.4f} F${feed_rate}\n"
+segment = "G01 X{x:.4f} Y{y:.4f} Z${draw_height} F${feed_rate}\n"
 
 line_end = """\
-G0 Z5
+G00 Z${travel_height}
 """
 
 document_end = """\
 M5
-G0 Z5
-G0 X0 Y0
+G00 Z${travel_height}
+G00 X0.0000 Y0.0000
 M2
 """
 EOF
 
 # ------------------------------------------------------------
 # SVG -> optimized single-color G-code.
+#
+# 1. linemerge       Join connected/nearby line segments
+# 2. linesimplify    Reduce unnecessary points
+# 3. linesort        Optimize path traversal order
 # ------------------------------------------------------------
 
 vpype --config "$CONFIG" \
